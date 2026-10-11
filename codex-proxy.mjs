@@ -1798,10 +1798,32 @@ class Daemon {
     });
     this.slowStreak = d.streak;
     this.latencyCooldownUntil = d.cooldownUntil || 0;
+    // ★ 把判定过程记下来（供 status 显示）★
+    //   为什么需要：连击计数原来是纯内部的，用户只看到"当前出口很慢、候选很快"
+    //   却什么都没发生 —— 因为还要连续满足 N 轮才切。看不见过程就会被误解成"没生效"。
+    this.lastDecision = {
+      reason: d.reason,
+      streak: d.streak ? d.streak.n : 0,
+      need: cfg.satisfiedPolls,
+      curMs: d.curMs,
+      candName: d.cand ? d.cand.name : null,
+      candMs: d.candMs,
+      at: now,
+    };
+
     if (d.switch) {
       log('warn', `性能判定切换出口：${current.name}(${d.curMs}ms) -> ${d.cand.name}(${d.candMs}ms)` +
         `（连续 ${cfg.satisfiedPolls} 次满足，之后 ${Math.round(cfg.cooldownMs / 1000)}s 冷静期）`);
       return d.cand;
+    }
+    // 待定/冷静期也记一条 info —— 这是"为什么还没切"的唯一线索。
+    // 只记有意思的两种：正在累计（pending）与冷静期（cooldown），其余不动（够快/无更优候选）不刷屏。
+    if (d.reason === 'pending') {
+      log('info', `性能判定待定：${current.name}(${d.curMs}ms) 慢于 ${d.cand.name}(${d.candMs}ms)，` +
+        `已连续 ${d.streak.n}/${cfg.satisfiedPolls} 次，满足即切换`);
+    } else if (d.reason === 'cooldown') {
+      const left = Math.max(0, Math.round(((this.latencyCooldownUntil || 0) - now) / 1000));
+      log('info', `性能判定暂停：冷却期还剩 ${left}s（期间即使条件成立也不切换）`);
     }
     return current;
   }
@@ -1922,6 +1944,12 @@ class Daemon {
         ...this.health.get(l.name),
       })),
       stats: this.bridge.stats,
+      // 性能判定的当前状态 —— 让 status 能回答"为什么还没切"：
+      //   reason=pending 表示正在累计（streak/need），cooldown 表示在冷静期
+      latencyDecision: this.lastDecision || null,
+      latencyCooldownMsLeft: this.latencyCooldownUntil
+        ? Math.max(0, this.latencyCooldownUntil - Date.now())
+        : 0,
     };
     try {
       fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
@@ -2287,6 +2315,23 @@ function cmdStatus() {
   }
   console.log('  * 延迟 = 一次真实 HTTPS 往返（只取响应头）；握手 = 只到本地出口端口的 SOCKS 握手。');
   console.log('    本机出口的握手值恒为 0~2ms，不能当延迟用 —— 这就是为什么用真实往返作判据。');
+
+  // ★ 性能判定的进度 ★
+  //   为什么必须显示：只看到"当前出口很慢、候选很快"却什么都没发生，会被误解成"没生效"。
+  //   实际还要连续满足 N 轮才切（防抖动），这里把过程摊开，让"为什么还没切"一眼可见。
+  {
+    const dec = st.latencyDecision;
+    const cdLeft = st.latencyCooldownMsLeft || 0;
+    if (cdLeft > 0) {
+      console.log('');
+      console.log(`  自动切换：冷静期还剩 ${Math.round(cdLeft / 1000)} 秒（期间即使条件成立也不切换，防抖动）`);
+    } else if (dec && dec.reason === 'pending') {
+      const tail = dec.candName ? `（候选 ${dec.candName} ${dec.candMs}ms，当前 ${dec.curMs}ms）` : '';
+      console.log('');
+      console.log(`  自动切换：正在累计 ${dec.streak}/${dec.need} 次 —— 连续到 ${dec.need} 次就切${tail}`);
+      console.log('    防抖动设计：条件要连续成立才切，中途一次不成立就清零重数（避免来回横跳）');
+    }
+  }
   const s = st.stats || {};
   // 活动连接分布在哪个出口 —— 排查"切换后界面还是呆住"时最有用的一行：
   // 如果活动连接还挂在旧出口上，说明它们还没被断开重建。

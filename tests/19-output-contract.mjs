@@ -351,6 +351,29 @@ step('I. 「延迟未测到」的含义固定住（连通 OK 但真实往返没�
     /h\.lastDetail = fails\[0\] \|\| '不通'/.test(mjs), '');
 }
 
+// ---------------------------------------------------------------- J. 切换进度可见
+step('J. 「为什么还没切」必须看得见（防抖动过程的可观测性）');
+{
+  // 背景：用户实测反馈"当前出口很慢、候选很快，为什么没切？"
+  //       实测证明机制是正常的（确实切了），但**过程不可见** ——
+  //       连击计数 slowStreak 原来纯内部，日志里只有"正在累计"没有、
+  //       只有成功切换才写一条。于是那 165 秒的等待看起来像"没生效"。
+  //       这是可观测性缺陷，不是逻辑缺陷，但同样会让人误判工具坏了。
+  check('判定过程写进 state.json（latencyDecision / latencyCooldownMsLeft）',
+    /latencyDecision: this\.lastDecision/.test(mjs) && /latencyCooldownMsLeft/.test(mjs), '');
+  check('pickFasterUplink 记录了 reason / streak / need / 候选对比',
+    /this\.lastDecision = \{/.test(mjs) && /candName: d\.cand \? d\.cand\.name : null/.test(mjs), '');
+  check('待定时写 info 日志（含"已连续 N/M 次"）',
+    /性能判定待定：/.test(mjs) && /已连续 \$\{d\.streak\.n\}\/\$\{cfg\.satisfiedPolls\} 次/.test(mjs), '');
+  check('冷静期也写日志（含剩余秒数）',
+    /性能判定暂停：冷却期还剩/.test(mjs), '');
+  check('status 会显示累计进度或冷静期',
+    /自动切换：正在累计/.test(mjs) && /自动切换：冷静期还剩/.test(mjs), '');
+  check('只在 pending / cooldown 时打印（不刷屏）',
+    /d\.reason === 'pending'/.test(mjs) && /d\.reason === 'cooldown'/.test(mjs) &&
+    /else if \(dec && dec\.reason === 'pending'\)/.test(mjs), '');
+}
+
 // ---------------------------------------------------------------- 汇总
 console.log('\n=== 汇总 ===');
 const pass = results.filter((r) => r.ok).length;
