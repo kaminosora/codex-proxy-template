@@ -115,7 +115,19 @@ step('D. 连接管理（防「界面呆住」）');
 // ================================================================ E. Codex 挂代理
 step('E. Codex 挂代理');
 {
-  check('桌面应用用 --proxy-server（Chromium 不读环境变量）', has('--proxy-server'));
+  // ★ 这一条曾经是假的 ★
+  //   原来写的是 `has('--proxy-server')` —— 只要源码里**出现这个字符串**就通过。
+  //   而实际代码里 spawn(exe, []) 传的是**空参数数组**：`--proxy-server` 只出现在
+  //   注释和"已挂代理"那句日志里。于是它长期"看着过、其实没测"。
+  //   真实后果：Codex 静默改用 Windows 系统代理，我们的 17890 一条连接都收不到
+  //   （实测：Codex 进程 43 条连接全部指向 127.0.0.1:7890，指向 17890 的 0 条）。
+  //   所以判据必须精确到"参数确实进了 spawn 的数组"。
+  check('桌面应用把 --proxy-server 真的传进 spawn 参数（不是只写在注释里）',
+    /const args = \[`--proxy-server=127\.0\.0\.1:\$\{cfg\.listen\.port\}`\]/.test(mjs) &&
+    /spawn\(exe, args, \{/.test(mjs));
+  check('启动后会核对"它到底有没有走我们"（防止再次静默退化）',
+    has('verifyCodexUsesOurProxy') && has('countLocalConnectionsTo') &&
+    /没有检测到 Codex 接上我们的代理/.test(mjs));
   check('CLI 注入代理环境变量', has('HTTP_PROXY') && has('HTTPS_PROXY'));
   check('注入 ALL_PROXY（socks5h）', has('socks5h://'));
   check('注入 NO_PROXY（本机不走代理）', has('NO_PROXY'));

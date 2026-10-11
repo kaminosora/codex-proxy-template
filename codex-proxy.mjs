@@ -2858,14 +2858,77 @@ async function cmdApp(cfg, argv = []) {
     await sleep(2500);
   }
   console.log(`启动 Codex 桌面应用（${verText}，策略 ${prefer}，已挂代理 127.0.0.1:${cfg.listen.port}）`);
-  const child = spawn(exe, [], {
+  // ★★ 必须传 --proxy-server 参数 ★★
+  //
+  // 这里曾经退化过：spawn 的第二个参数变成了空数组 `[]`，
+  // 只剩环境变量注入 —— 而 Codex 桌面版是 Chromium，**实测不读代理环境变量**
+  // （见"三路径对照实验"）。于是它静默地改用 **Windows 系统代理**（Clash Party 的 7890），
+  // 我们的 17890 一条连接都没接到。而这一行的日志照样打印"已挂代理"—— 说的和做的不一致。
+  //
+  // 实测证据（2026-10-12）：Codex 进程 43 条 ESTABLISHED 全部指向 127.0.0.1:7890，
+  // 指向 17890 的 0 条。用户也确认："不开系统代理，codex 一直到不了首页。"
+  //
+  // 为什么只给主进程就够了：Chromium 的 `--proxy-server` 由主进程解析，
+  // 再通过命令行**传递给所有子进程**（渲染进程 / GPU / 网络服务继承同一个代理配置），
+  // 所以不需要自己遍历子进程。文档"三路径对照实验"那一节有实测数据
+  // （给主进程传参数 → 走我们的代理 16 条、直连外网 0 条）。
+  const args = [`--proxy-server=127.0.0.1:${cfg.listen.port}`];
+  if (cfg.codex?.noFirstRun !== false) args.push('--no-first-run');
+  const child = spawn(exe, args, {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, ...proxyEnv(cfg.listen.port, cfg.codex.extraEnv) },
     windowsHide: false,
   });
   child.unref();
+
+  // ★ 启动后核对：它到底有没有走我们 ★
+  //   为什么必须核对：上面那个 bug 之所以能藏住，就是因为没人检查"说的和做的是否一致"。
+  //   如果参数没被采纳（应用改版、或被系统代理抢先），这里会明确报出来，不再静默。
+  const started = await verifyCodexUsesOurProxy(cfg, base, exe);
+  if (!started.ok) {
+    console.log('');
+    console.log('  ⚠ 没有检测到 Codex 接上我们的代理 —— 它可能走了 Windows 系统代理。');
+    console.log(`     检测到 ${base} 进程 ${started.pids.length} 个，但没有指向 127.0.0.1:${cfg.listen.port} 的连接。`);
+    console.log('     影响：脚本的"只影响 Codex、其它应用不受影响"这一条不成立，');
+    console.log('           而且它会跟随系统代理（Clash Party 之类）走。');
+    console.log('     可以先看：.\\codex-proxy.ps1 conns   （我们这边应该是 0 条）');
+  }
   return 0;
+}
+
+/**
+ * 等一会儿，然后核对 Codex 是否真的在用我们的代理。
+ * 返回 { ok, pids, conns }。**只做检查，不改变任何东西。**
+ */
+async function verifyCodexUsesOurProxy(cfg, base, exe) {
+  const port = cfg.listen.port;
+  for (let i = 0; i < 12; i++) {
+    await sleep(1000);
+    const pids = listProcesses(base);
+    if (!pids.length) continue;
+    // 判据 1：命令行里有我们的 --proxy-server
+    if (codexUsingOurProxy(cfg, pids)) return { ok: true, pids, conns: null };
+    // 判据 2：确实有连到我们端口的已建立连接
+    const n = countLocalConnectionsTo(port);
+    if (n > 0) return { ok: true, pids, conns: n };
+  }
+  return { ok: false, pids: listProcesses(base), conns: 0 };
+}
+
+/** 数一下有多少条已建立连接指向本机某个端口（失败时返回 0，不抛） */
+function countLocalConnectionsTo(port) {
+  try {
+    const out = spawnSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8', windowsHide: true });
+    if (out.error || typeof out.stdout !== 'string') return 0;
+    let n = 0;
+    for (const line of out.stdout.split('\n')) {
+      const p = line.trim().split(/\s+/);
+      if (p.length < 5 || p[0] !== 'TCP' || p[3] !== 'ESTABLISHED') continue;
+      if (p[1].endsWith(':' + port)) n++;
+    }
+    return n;
+  } catch { return 0; }
 }
 
 // ---------------------------------------------------------------- 入口
