@@ -88,7 +88,15 @@ function loadConfig() {
     minGainMs: 150,        // 且至少快这么多毫秒，避免"50ms→20ms 也切"
     satisfiedPolls: 3,     // 连续满足多少次才切换（3 × 15s ≈ 45 秒）
     cooldownMs: 120000,    // 切换后的冷静期（2 分钟）
-    connIdleTimeoutSec: 120,  // 连接连续这么久无数据就断开，逼客户端重连（防上游黑洞卡死界面）
+    connIdleTimeoutSec: 120,   // 连接连续这么久无数据就断开，逼客户端重连（防上游黑洞卡死界面）
+    // 切换出口时断开旧连接的"宽限"：只有空闲超过这么久（毫秒）的连接才算"卡住"、才断。
+    // 为什么要宽限：Codex 是 Chromium，无条件断连会把它的在途请求腰斩，
+    // 界面退化成「Couldn't load workspace settings」（用户实测报告）。
+    // 留着正在传输的连接，卡住的（lastActivity 不动）照样清掉。
+    switchDropGraceMs: 1500,
+    // 出口被判 DOWN 时的宽限：0 = 全断。判 DOWN 意味着连握手都不通，
+    // 上面的连接不可能恢复，留着只会让界面继续等（"呆住"的成因）。
+    downDropGraceMs: 0,
     latencyTarget: { host: 'speed.cloudflare.com', path: '/__down?bytes=1' },
     ...(c.health || {}),
   };
@@ -711,18 +719,48 @@ class Bridge {
    *
    *   只有把这些连接关掉，Codex 才会重新建连，而新建的连接会走新出口，界面立刻恢复。
    */
-  dropConnectionsOnUplink(uplinkName, why) {
-    let n = 0;
+  dropConnectionsOnUplink(uplinkName, why, opts = {}) {
+    // ★ 只断开"已经卡住"的连接，不动正在传输的 ★
+    //
+    // 踩过的坑（用户实测报告）：原来是无条件 destroy 该出口上的**每一条**连接，
+    // 结果**每次切出口都把 Codex 的在途请求砍断** —— 表现为界面突然退化成
+    // 「Couldn't load workspace settings / Retry to continue chatting」，
+    // 或者停在加载态。用户的原话："看 codex 弹窗基本上就相当于是断连了"。
+    //
+    // 而真正需要断的只是"卡住不动"的那些。两者的判据现成就有：
+    //   rec.lastActivity 在每次收发数据时都会更新（见 pipe 里的 touch()）。
+    //   正在传输 → lastActivity 是刚刚；上游黑洞 → lastActivity 停在那里不动。
+    //
+    // 所以：空闲超过 graceMs 的才断。这样
+    //   · 正在跑的请求能跑完（不再被腰斩）
+    //   · 卡住的连接照样被清掉（原 bug 的修复效果保留）
+    //   · 之后 Codex 复用旧连接时会发现它已被关闭，于是自然重连到新出口
+    const graceMs = Number.isFinite(opts.graceMs)
+      ? opts.graceMs
+      : (this.cfg?.health?.switchDropGraceMs ?? 1500);
+    const now = Date.now();
+    let dropped = 0, kept = 0, keptBytes = 0;
     for (const rec of [...this.conns]) {
       if (rec.uplink !== uplinkName) continue;
-      n++;
-      log('warn', `因${why}主动断开挂在 ${uplinkName} 上的连接（${rec.peer}，已活跃 ${Math.round((Date.now() - rec.openedAt) / 1000)}s，` +
-        `空闲 ${Math.round((Date.now() - rec.lastActivity) / 1000)}s，${fmtBytes(rec.bytes)}）`);
+      const idleMs = now - rec.lastActivity;
+      if (idleMs < graceMs) {
+        // 还在传数据 —— 留着。宁可让它跑完，也不要腰斩用户正在等的请求。
+        kept++;
+        keptBytes += rec.bytes || 0;
+        continue;
+      }
+      dropped++;
+      log('warn', `因${why}主动断开已卡住的连接（${rec.peer}，已活跃 ${Math.round((now - rec.openedAt) / 1000)}s，` +
+        `空闲 ${Math.round(idleMs / 1000)}s，${fmtBytes(rec.bytes)}）`);
       try { rec.client.destroy(); } catch {}
       try { rec.upstream.destroy(); } catch {}
     }
-    if (n) log('warn', `共断开 ${n} 条连接 —— Codex 会自动重连，新连接走当前出口`);
-    return n;
+    if (dropped) log('warn', `共断开 ${dropped} 条卡住的连接 —— Codex 会自动重连，新连接走当前出口`);
+    if (kept) {
+      log('info', `保留了 ${kept} 条正在传输的连接（共 ${fmtBytes(keptBytes)}）—— 不腰斩在途请求；` +
+        `它们结束或卡住后会被后续清理`);
+    }
+    return dropped;
   }
 
   /** 兜底：清掉长时间完全没数据的连接（防上游黑洞导致的"卡住但不断"） */
@@ -1844,16 +1882,30 @@ class Daemon {
       this.activeUplink = next;
       const ms = this.health.get(next.name)?.lastMs;
       log('info', `出口切换：${prev ? prev.name : '无'} -> ${next.name}（${ms ?? '?'}ms）`);
-      if (prev) this.bridge.dropConnectionsOnUplink(prev.name, '切换出口');
+      // 切换时用【宽限】：只断开已经卡住的，不腰斩正在传输的请求。
+      // 用户实测报告：无条件断连会让 Codex 界面退化成
+      // 「Couldn't load workspace settings / Retry to continue chatting」。
+      if (prev) {
+        this.bridge.dropConnectionsOnUplink(prev.name, '切换出口', {
+          graceMs: this.cfg.health.switchDropGraceMs ?? 1500,
+        });
+      }
     } else {
       this.activeUplink = next;
     }
     // 任何被判 DOWN 的出口，挂在它上面的连接也该断开。
     // 场景：界面正卡在 xray 上，探测把 xray 判 DOWN，但当前出口是另一条，
     // 上面那个"切换出口"分支就不会触发，卡住的连接就留着了。
+    //
+    // 这一支用【零宽限】：出口判 DOWN 意味着连握手都不通了，那上面的连接
+    // 不可能再恢复，留着只会让界面继续等（正是"呆住"的成因）。
     for (const l of this.uplinks) {
       const h = this.health.get(l.name);
-      if (h && h.ok === false) this.bridge.dropConnectionsOnUplink(l.name, '该出口被判不健康');
+      if (h && h.ok === false) {
+        this.bridge.dropConnectionsOnUplink(l.name, '该出口被判不健康', {
+          graceMs: this.cfg.health.downDropGraceMs ?? 0,
+        });
+      }
     }
     this.writeState();
   }

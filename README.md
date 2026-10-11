@@ -78,7 +78,7 @@ cd C:\codex-proxy
 | `codex-proxy.mjs` | 守护进程（出口管理 + 本地桥接） |
 | `codex-proxy.config.json` | 配置 |
 | `bin\xray.exe` | xray 客户端 |
-| `tests\` | 测试套件（21 个脚本 + 调度器），`.\codex-proxy.ps1 tests` 跑全部 |
+| `tests\` | 测试套件（22 个脚本 + 调度器），`.\codex-proxy.ps1 tests` 跑全部 |
 | `logs\`、`run\` | 日志与运行状态（自动生成） |
 
 ## 卸载
