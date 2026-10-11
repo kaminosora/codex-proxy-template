@@ -102,14 +102,14 @@
       "path": "/__down?bytes=1"
     },
     "//latencyTarget": "每次探测都会向它发一次真实 HTTPS 请求（只取响应头），用往返耗时作为 status 里显示的『延迟』和自动切换的判据。注意不能用 probeVia 的握手值——那是本地握手，xray/mihomo 会显示 0ms 并系统性地压过 ssh。",
-    "connIdleTimeoutSec": 600,
+    "connIdleTimeoutSec": 0,
     "//connIdleMaxSec": "传过数据的连接的上限兜底：即使传过字节，连续这么久没动静也会被清（默认 1800 = 30 分钟）。",
     "connIdleMaxSec": 1800,
     "//switchDropGraceMs": "切换出口时断连的宽限（毫秒）：只有空闲超过它才算“卡住”、才断。默认 1500。",
     "switchDropGraceMs": 1500,
     "//downDropGraceMs": "出口被判 DOWN 时的宽限：默认 0 = 全断（握手都不通了，上面的连接不可能恢复）。",
     "downDropGraceMs": 0,
-    "//connIdleTimeoutSec": "兜底清理：连接连续这么多秒没有任何数据【且从未传过任何字节】，才主动断开。默认 600（10 分钟），设 0 关闭。★ 必须保守 ★ 早期设 120 秒一刀切，把 Codex 正常的 WebSocket / 推送长连接当成“卡死”杀了，界面直接退化（日志实证：空闲超时（134s 无数据）主动断开）。真正防“卡住”的是出口切换时只断卡住的连接、以及出口判 DOWN 时全断——不是这里。"
+    "//connIdleTimeoutSec": "空闲连接清理：默认 0 = 【关闭】。为什么默认关闭：这是\"猜哪条连接没用\"，而猜错的代价不可恢复 —— 实测把 Codex 正常的 WebSocket / 推送长连接当成\"卡死\"杀掉后，界面退化并且不会自动恢复（用户报告：\"一旦退化就再也没法恢复，除非重启\"）。Clash 系（Clash for Windows / mihomo）的默认行为就是从不主动打断已建立的连接（官方文档 Break When Proxy Change 默认 None），只让新建的连接走新节点。想强行清掉重来用 .\\codex-proxy.ps1 restart。要开启就设成正数秒数。"
   },
   "codex": {
     "//": "Codex 路径。两个都留空即可 —— 脚本会自动定位。",

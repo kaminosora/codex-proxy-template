@@ -117,14 +117,20 @@ check('conns 表清空', bridge.conns.size === 0, `实际 ${bridge.conns.size}`)
 // ---------------------------------------------------------------- 默认值
 step('4. 默认阈值必须足够保守');
 const h = M.loadConfig().health;
-check('connIdleTimeoutSec ≥ 600 秒（原来是 120，误杀长连接）',
-  Number(h.connIdleTimeoutSec) >= 600, `实际 ${h.connIdleTimeoutSec}`);
+// ★ 默认值现在是 0 = 关闭 ★
+//   理由：无法可靠区分"在等响应的请求"与"空闲的长连接"，而猜错的代价不可恢复。
+//   Clash 系（CFW / mihomo）默认就是从不打断已建立的连接。
+check('connIdleTimeoutSec 默认 = 0（关闭，跟 Clash 系一致，不猜）',
+  Number(h.connIdleTimeoutSec) === 0, `实际 ${h.connIdleTimeoutSec}`);
+check('如果开启，阈值必须 ≥ 600 秒（不能是 120，那会误杀长连接）',
+  Number(h.connIdleTimeoutSec) === 0 || Number(h.connIdleTimeoutSec) >= 600,
+  `实际 ${h.connIdleTimeoutSec}`);
 check('connIdleMaxSec 有上限兜底', Number(h.connIdleMaxSec) >= 1800, `实际 ${h.connIdleMaxSec}`);
 const fs = await import('node:fs');
 const cfgRaw = fs.readFileSync(path.join(ROOT, 'codex-proxy.config.json'), 'utf8');
-// 说明文字里要留下"为什么必须保守"的教训，否则以后有人又会把它调回 120 秒
-check('配置文件里写明了"必须保守"的原因（提到长连接被误杀）',
-  /必须保守/.test(cfgRaw) && /长连接/.test(cfgRaw) && /当成“卡死”杀了/.test(cfgRaw), '');
+// 说明文字要留下"为什么默认关闭"的教训，否则以后有人又会把它打开成 120 秒
+check('配置文件里写明了"默认关闭"的原因（长连接被误杀 + 不可恢复）',
+  /默认 0 = 【关闭】/.test(cfgRaw) && /长连接/.test(cfgRaw) && /不会自动恢复/.test(cfgRaw), '');
 check('0 表示关闭（保持原有语义）', bridge.reapIdleConnections(0) === 0, '');
 
 // ---------------------------------------------------------------- 静态核对
