@@ -326,6 +326,31 @@ step('H. 内核退让链（找不到我们的副本时不能直接失败）');
     /codex-core\.exe$/i.test(up.coreExe() || ''), up.coreExe() || '');
 }
 
+// ---------------------------------------------------------------- I. 「延迟未测到」
+step('I. 「延迟未测到」的含义固定住（连通 OK 但真实往返没测到）');
+{
+  // 现象：status 里出现 `OK  -  1ms  正常（延迟未测到）`
+  // 含义：连通性探测（probeVia，到三个目标的 SOCKS 握手）成功了，所以出口判为 OK；
+  //       但额外那次"真实 HTTPS 往返"（latency target，maxBytes:1）没在超时内完成，
+  //       于是延迟显示 `-`。判据一律不用它：latencyFresh=false → 不参与自动切换。
+  check('连通成功但往返失败时，延迟留空并标不新鲜',
+    /h\.lastMs = realMs/.test(mjs) &&
+    /h\.latencyFresh = realMs !== null/.test(mjs) &&
+    /'正常（延迟未测到）'/.test(mjs), '');
+  check('延迟未测到时不会拿旧数字做切换判据（第 4 层直接放弃）',
+    /!curH\.latencyFresh \|\| typeof curH\.lastMs !== 'number'\) return keep\('no-fresh-latency'\)/.test(mjs) &&
+    /!h\.latencyFresh \|\| typeof h\.lastMs !== 'number'\) continue;/.test(mjs),
+    '同一条规则对"当前出口"和"候选出口"都生效');
+  check('status 的延迟列按 latencyFresh 决定显示 ms 还是 -',
+    /const lat = \(u\.latencyFresh && typeof u\.lastMs === 'number'\)/.test(mjs), '');
+  check('探测全失败时【握手值也作废】（否则会显示上一轮的旧数字，误导成"握手通"）',
+    /h\.handshakeMs = null;/.test(mjs), '');
+  check('握手列只在有数字时显示 ms',
+    /const shake = \(typeof u\.handshakeMs === 'number'\)/.test(mjs), '');
+  check('探测全失败时把原因写进 lastDetail（不是笼统的"不通"）',
+    /h\.lastDetail = fails\[0\] \|\| '不通'/.test(mjs), '');
+}
+
 // ---------------------------------------------------------------- 汇总
 console.log('\n=== 汇总 ===');
 const pass = results.filter((r) => r.ok).length;

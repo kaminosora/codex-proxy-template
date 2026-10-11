@@ -1719,6 +1719,11 @@ class Daemon {
         h.failStreak++; h.okStreak = 0;
         h.lastDetail = fails[0] || '不通';
         h.latencyFresh = false;                    // 延迟数据作废，不能拿旧数字做切换判断
+        // ★ 握手值也要作废 ★
+        //   不清的话 status 会显示"上一轮成功探测的握手值"，而同一行的延迟是 `-`，
+        //   看起来像"握手通、延迟不通"—— 其实这一轮【全部探测都失败了】，两个值都不可信。
+        //   判据本来就只用 latencyFresh，这里只是让显示与事实一致。
+        h.handshakeMs = null;
         if (h.failStreak >= this.cfg.health.failThreshold) h.ok = false;
       }
     }
