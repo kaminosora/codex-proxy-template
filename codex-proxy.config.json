@@ -1,0 +1,125 @@
+{
+  "//": "Codex 专用代理的配置。改完不用重启系统，重跑 codex-proxy.ps1 restart 即可生效。",
+  "listen": {
+    "//": "本地代理监听端口。Codex 只会连这个 127.0.0.1 端口，其它应用一概不受影响。",
+    "port": 17890
+  },
+  "uplinks": {
+    "//": "按顺序探测，第一个健康的作为出口。priority 越小越优先。",
+    "ssh": {
+      "//": "主出口：SSH 动态转发到日本服务器，不需要改动服务器任何配置。",
+      "enabled": true,
+      "priority": 1,
+      "host": "YOUR_SERVER_IP",
+      "port": 22,
+      "user": "root",
+      "identityFile": "C:\\Users\\YOUR_NAME\\.ssh\\id_ed25519_your_server",
+      "//identityFile": "留空则只用 ssh-agent 里已加载的密钥",
+      "socksPort": 17891,
+      "connectTimeoutSec": 12,
+      "serverAliveIntervalSec": 15,
+      "serverAliveCountMax": 3,
+      "restartBackoffMs": [
+        1000,
+        2000,
+        5000,
+        10000,
+        20000,
+        30000
+      ]
+    },
+    "xray": {
+      "//": "可选出口：在本机跑一个 xray 客户端，复用服务器 443 上的 VLESS Reality 入站。默认关闭。",
+      "//risk": "服务器现在只有一个客户端（带 xtls-rprx-vision flow）。复用同一个 UUID 大概率可用，但没有实测过；若要用，建议在服务器上为本机单独加一个 UUID，互不影响。",
+      "//howto": "1) 从服务器 /usr/local/etc/xray/config.json 取 clients[0].id 填到 uuid；2) 把 xrayExe 指向本机 xray.exe；3) 把 enabled 改成 true；4) 重启本脚本。",
+      "enabled": true,
+      "priority": 2,
+      "xrayExe": "C:\\codex-proxy\\bin\\xray.exe",
+      "port": 17892,
+      "server": "YOUR_SERVER_IP",
+      "serverPort": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "flow": "xtls-rprx-vision",
+      "sni": "www.apple.com",
+      "//fieldName": "REALITY 客户端公钥。Xray 26.x 叫 password，旧版叫 publicKey，两个名字都认。",
+      "//WARNING": "这里必须填【公钥】！用 xray x25519 -i \"<服务器 privateKey>\" 反推得到。填成私钥会导致 REALITY 握手回落成真实 apple.com 证书，所有连接被重置（已实测）。",
+      "password": "REPLACE_WITH_YOUR_REALITY_PUBLIC_KEY",
+      "shortId": "REPLACE_WITH_YOUR_SHORT_ID",
+      "fingerprint": "chrome",
+      "spiderX": "/"
+    },
+    "clashParty": {
+      "//": "回落出口：用你自己的订阅节点跑一个独立的 mihomo 实例，独立进程、独立配置、独立端口，不碰你正在运行的 Clash Party。",
+      "enabled": true,
+      "priority": 3,
+      "dataDir": "C:\\Users\\YOUR_NAME\\AppData\\Roaming\\mihomo-party",
+      "coreExe": "",
+      "//coreExe": "留空即可：会自动优先用 bin\\codex-core.exe（我们自己的内核副本）。★不要填 Clash Party 目录下的 mihomo.exe★——那个进程名会让 Clash Party 启动时把它误判成『高权限内核』并弹窗要求以管理员重启（选取消它会直接退出）。详见 故障排查与说明.md。",
+      "//dataDir": "只读取这里的 subscription（profile.yaml + profiles\\<id>.yaml），绝不写入。",
+      "mixedPort": 17893,
+      "preferNodeNameRegex": "日本|JP|Japan|东京|Tokyo|大阪|Osaka|🇯🇵",
+      "maxNodes": 8
+    }
+  },
+  "health": {
+    "//": "探测目标：能用 HTTP CONNECT / SOCKS5 打通并拿到任意 HTTP 响应即视为健康。",
+    "targets": [
+      {
+        "host": "codex-cloud-backend.chatgpt.com",
+        "port": 443
+      },
+      {
+        "host": "chatgpt.com",
+        "port": 443
+      },
+      {
+        "host": "api.openai.com",
+        "port": 443
+      }
+    ],
+    "intervalMs": 15000,
+    "timeoutMs": 8000,
+    "failThreshold": 2,
+    "recoverThreshold": 1,
+    "//设计原则": "priority 只在【第一次必须挑一个出来】时生效；之后一律由下面的性能判定选出最优，与谁优先级高无关。",
+    "//latencyAware": "性能判定总开关。开启后：当前出口还没快到『不值得折腾』，且存在明显更优的候选时，自动换过去。",
+    "latencyAware": true,
+    "slowMs": 250,
+    "//slowMs": "【地板】当前出口延迟低于它就认为够快了、不再折腾（哪怕别人快 10 倍）。默认 250ms。★注意它不是『超过才算慢』的高门槛★——把它设大（如 800）会让中间区间变成永不优化的死区（600ms vs 300ms 差一倍也放着不动）。",
+    "fastRatio": 2,
+    "//fastRatio": "候选要比当前【快这么多倍】才算明显更优。默认 2 倍。这是相对阈值，与 slowMs 无关。",
+    "minGainMs": 150,
+    "//minGainMs": "候选还要【至少快这么多毫秒】。默认 150ms。与 fastRatio 一起卡，避免『50ms→20ms 也切』这种无意义切换。",
+    "satisfiedPolls": 3,
+    "//satisfiedPolls": "上述条件必须【连续满足】这么多次才真正切换（每次间隔 intervalMs）。默认 3 次 ≈ 45 秒；中途一次不成立就清零重数。",
+    "cooldownMs": 120000,
+    "//cooldownMs": "切换后的冷静期，期内不再因性能切换。默认 120000（2 分钟）—— 防来回横跳最重要的一道闸门。",
+    "//防横跳原理": "切过去后，旧出口要【反向满足同样苛刻的条件】才能夺回（先超 slowMs + 新出口快 2 倍以上 + 连续 3 次 + 过冷静期）。因为切换本就冲着明显更优去，反向几乎不可能成立。",
+    "//重要限制": "ssh:jp 和 xray:jp 是同一台服务器，换出口只换了『到服务器的接入方式』，换不了服务器到 OpenAI 那段路。若那段慢，只有订阅节点是不同的路径。",
+    "//切了会不会断": "不会。Codex 始终连 127.0.0.1:17890，切换只影响【新建】的连接；已在传输的连接留在旧出口直到自然结束。",
+    "latencyTarget": {
+      "host": "speed.cloudflare.com",
+      "path": "/__down?bytes=1"
+    },
+    "//latencyTarget": "每次探测都会向它发一次真实 HTTPS 请求（只取响应头），用往返耗时作为 status 里显示的『延迟』和自动切换的判据。注意不能用 probeVia 的握手值——那是本地握手，xray/mihomo 会显示 0ms 并系统性地压过 ssh。",
+    "connIdleTimeoutSec": 120,
+    "//connIdleTimeoutSec": "空闲连接清理：某条已建立的连接连续这么多秒没有任何数据，就主动断开，逼客户端重连。默认 120 秒，设 0 关闭。为什么需要：上游出现黑洞时 TCP 不会断开、只是卡住，客户端便一直等（界面呆住）。"
+  },
+  "codex": {
+    "//": "Codex 路径。两个都留空即可 —— 脚本会自动定位。",
+    "//cli": "CLI 本体：%LOCALAPPDATA%\\OpenAI\\Codex\\bin\\<哈希>\\codex.exe",
+    "//desktopExe": "留空 = 自动定位。也可以直接写死一个完整路径（JSON 里反斜杠写两个）。",
+    "//desktopPrefer": "桌面应用版本选择策略：'registered'（默认）= 用已注册的版本，等价于双击桌面快捷方式；'newest' = 用磁盘上最新的版本（可能包含还没注册完成的新版）；'running' = 用当前正在运行的版本。",
+    "desktopExe": "",
+    "desktopPrefer": "registered",
+    "cliExe": "",
+    "//proxyMode": "桌面应用是 Chromium 内核，不读 HTTPS_PROXY 环境变量，只认系统代理。所以启动器对桌面应用用 --proxy-server 命令行开关（只影响 Codex 自己），CLI 则用环境变量。",
+    "extraEnv": {
+      "NO_PROXY": "localhost,127.0.0.1,::1,127.0.0.0/8"
+    }
+  },
+  "log": {
+    "dir": "logs",
+    "level": "info"
+  }
+}
