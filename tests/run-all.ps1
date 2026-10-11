@@ -47,6 +47,28 @@ $suites = @(
 # 注意：必须用 @() 包起来。只筛出一个套件时，Where-Object 返回的是【单个哈希表】，
 # 而哈希表的 .Count 是【键的个数】（这里正好 6 个），会打印出"6 个套件"却只列 1 个。
 # 套上 @() 强制成数组，.Count 才是元素个数。
+# ★ 修一个真 bug：`-Only 01,08` 筛不出任何套件 ★
+#
+# 参数声明是 [string[]]$Only，但用 `pwsh -NoProfile -File tests\run-all.ps1 -Only 01,08`
+# 调用时，PowerShell **不会**把 "01,08" 按逗号拆开 —— 整个字符串成了一个元素，
+# 于是 `$Only -contains '01'` 永远为 false，筛出 0 个套件。
+#
+# 这个写法是 tests\README.md 里明确教的（"只跑指定的"），所以必须能用。
+# 修法：拿到值后再按逗号/空格拆一次，两种调用方式都支持：
+#   -Only 01,08        ← -File 方式（README 教的）
+#   -Only 01,08 -SkipSlow
+#   -Only @('01','08') ← 点源方式
+# ---------------------------------------------------------------------------
+$Only = @(
+    $Only |
+        ForEach-Object { "$_" -split '[,\s]+' } |
+        Where-Object { $_ -ne '' } |
+        ForEach-Object { $_.Trim() }
+)
+if ($Only.Count -gt 0) {
+    Write-Host "  只跑指定套件: $($Only -join ', ')" -ForegroundColor DarkGray
+}
+
 $selected = @($suites | Where-Object {
     ($Only.Count -eq 0 -or $Only -contains $_.Id) -and (-not $SkipSlow -or -not $_.Slow)
 })
@@ -63,29 +85,34 @@ Write-Host ''
 $summary = @()
 
 # ---------------------------------------------------------------------------
-# 跑之前先把守护进程拉起来（02/07/08 需要它）
-#
-# 为什么必须在这里做：**06 号套件跑完会把守护进程停掉**（它本来就专门测起停），
-# 于是紧随其后的 07 就会发现 17890 没在监听、直接报"结论无效"而不跑 —— 实测踩过。
-# 让每个用户自己记得先 start 是不可靠的，编排器负责这件事。
+
 # ---------------------------------------------------------------------------
-$needDaemon = @($selected | Where-Object { $_.Need -like '*守护进程*' -or $_.Id -in @('02', '07', '08') })
-if ($needDaemon.Count -gt 0) {
+# 确保守护进程在跑（需要它的套件，**每个套件运行前**都会调一次）
+#
+# ★ 为什么是"每个套件之前"而不是"整轮开始之前" ★
+#   **06 号套件跑完会把守护进程停掉**（它本来就专门测起停）。
+#   早期只在整轮开始前拉一次，于是紧随其后的 07 发现 17890 没在监听、
+#   直接报"结论无效"而不跑 —— 实测踩过（17 通过 / 1 失败，唯一失败就是 07）。
+#   更早的版本还试图让用户自己记得先 start，那更不可靠。
+#   改成逐套件检查后，06 无论怎么折腾都不影响后面的 07/08。
+# ---------------------------------------------------------------------------
+function Ensure-Daemon {
+    param([string]$Why)
     $proxyPort = 17890
     $live = [bool](netstat -ano | Select-String 'LISTENING' | Select-String ":$proxyPort\b")
-    if (-not $live) {
-        Write-Host "  守护进程没在运行（$proxyPort 未监听），先启动它 —— $($needDaemon.Id -join '/') 需要它" -ForegroundColor DarkGray
-        & node (Join-Path $ROOT 'codex-proxy.mjs') start *> $null
-        # 等它真的开始监听（三出口全启要 10 秒以上）
-        for ($i = 0; $i -lt 60; $i++) {
-            Start-Sleep -Milliseconds 500
-            $live = [bool](netstat -ano | Select-String 'LISTENING' | Select-String ":$proxyPort\b")
-            if ($live) { break }
-        }
-        if ($live) { Write-Host "  ✔ 守护进程已启动（$proxyPort 已监听）" -ForegroundColor DarkGray }
-        else { Write-Host "  ⚠ 守护进程没能启动，需要它的套件会自行报错" -ForegroundColor Red }
+    if ($live) { return $true }
+
+    Write-Host "  守护进程没在运行（$proxyPort 未监听），先启动它 —— $Why 需要它" -ForegroundColor DarkGray
+    & node (Join-Path $ROOT 'codex-proxy.mjs') start *> $null
+    # 等它真的开始监听（三出口全启要 10 秒以上，最多等 30 秒）
+    for ($k = 0; $k -lt 60; $k++) {
+        Start-Sleep -Milliseconds 500
+        $live = [bool](netstat -ano | Select-String 'LISTENING' | Select-String ":$proxyPort\b")
+        if ($live) { break }
     }
-    Write-Host ''
+    if ($live) { Write-Host "  ✔ 守护进程已启动（$proxyPort 已监听）" -ForegroundColor DarkGray }
+    else { Write-Host "  ⚠ 守护进程没能启动，需要它的套件会自行报错" -ForegroundColor Red }
+    return $live
 }
 
 foreach ($s in $selected) {
@@ -98,6 +125,13 @@ foreach ($s in $selected) {
         Write-Host '  脚本不存在，跳过' -ForegroundColor Red
         $summary += [pscustomobject]@{ Id = $s.Id; Name = $s.Name; Exit = -1; Note = '脚本不存在' }
         continue
+    }
+
+    # ★ 逐套件确保守护进程在跑 ★
+    #   必须在【每个】套件之前查，因为 06 会把守护进程停掉。
+    #   06 自己不需要它（它专门测起停），所以排除掉。
+    if ($s.Id -ne '06' -and ($s.Need -like '*守护进程*' -or $s.Id -in @('02', '07', '08'))) {
+        $null = Ensure-Daemon -Why "[$($s.Id)] $($s.Name)"
     }
 
     $t0 = Get-Date
