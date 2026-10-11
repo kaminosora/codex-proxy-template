@@ -22,16 +22,32 @@ Codex 桌面应用是 Chromium 内核，**不读 `HTTPS_PROXY` 环境变量**；
 
 ## 快速开始
 
+### 第一次用（或换了台机器）
+
 ```powershell
 cd C:\codex-proxy
-.\codex-proxy.ps1 app        # 一条命令：启动代理 + 带代理启动 Codex
+.\setup.ps1                 # 交互式引导：填配置 → 下二进制 → 真实验证
 ```
 
-确认出口：
+它会一步步问你，每一步都说明"这是什么、去哪拿、填错会怎样"，并在最后**真的起一遍验证**。
+只想先看看自己缺什么：
 
 ```powershell
-.\codex-proxy.ps1 check      # 出口 IP 应为你日本服务器的 IP
+.\setup.ps1 -Check          # 只体检，不改任何东西
 ```
+
+### 已经配置好
+
+```powershell
+.\codex-proxy.ps1 app       # 一条命令：启动代理 + 带代理启动 Codex
+.\codex-proxy.ps1 check     # 出口 IP 应为你服务器的 IP
+```
+
+> 如果 `bin\` 下缺 xray / mihomo 内核，单独补：
+> ```powershell
+> .\bin\fetch-binaries.ps1            # 自动从 Clash Party 复制，或从官方 GitHub 下载
+> .\bin\fetch-binaries.ps1 -DryRun    # 先看它会做什么
+> ```
 
 ## 三层出口
 
@@ -47,6 +63,7 @@ cd C:\codex-proxy
 
 | 文档 | 内容 |
 |---|---|
+| [配置前必读.md](配置前必读.md) | **要填哪些占位符、怎么拿那些值**（模板仓库里必备） |
 | [使用手册.md](使用手册.md) | **怎么用**：首次使用、日常命令、配置说明、卸载 |
 | [故障排查与说明.md](故障排查与说明.md) | **为什么**：故障排查、设计取舍、踩过的坑、实测记录 |
 | [tests/README.md](tests/README.md) | **怎么验证**：测试脚本说明、预期结果、历史测试记录 |
@@ -55,7 +72,9 @@ cd C:\codex-proxy
 
 | 文件 | 作用 |
 |---|---|
+| `setup.ps1` | **初次运行的交互式配置引导**（填配置 + 下二进制 + 验证） |
 | `codex-proxy.ps1` | 入口脚本，日常只用这个 |
+| `bin\fetch-binaries.ps1` | 自动补齐 xray / mihomo 内核（含下载与改名） |
 | `codex-proxy.mjs` | 守护进程（出口管理 + 本地桥接） |
 | `codex-proxy.config.json` | 配置 |
 | `bin\xray.exe` | xray 客户端 |
