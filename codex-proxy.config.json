@@ -109,7 +109,9 @@
     "downDropGraceMs": 0,
     "//connIdleTimeoutSec": "空闲连接清理：默认 0 = 【关闭】。为什么默认关闭：这是\"猜哪条连接没用\"，而猜错的代价不可恢复 —— 实测把 Codex 正常的 WebSocket / 推送长连接当成\"卡死\"杀掉后，界面退化并且不会自动恢复（用户报告：\"一旦退化就再也没法恢复，除非重启\"）。Clash 系（Clash for Windows / mihomo）的默认行为就是从不主动打断已建立的连接（官方文档 Break When Proxy Change 默认 None），只让新建的连接走新节点。想强行清掉重来用 .\\codex-proxy.ps1 restart。要开启就设成正数秒数。",
     "switchDropAll": false,
-    "//switchDropAll": "切换出口时是否断开旧出口上的全部连接。默认 false = 【不断任何连接】，跟 Clash 系一致：新建的连接立刻走新出口，已建立的原样留在旧出口直到它们自己结束。为什么默认不断：从代理这一层根本分不清“长时间在等消息”和“卡住了”——两者都是没有数据。Codex 有的是合法地长时间无数据的请求（等用户批准、等工具执行、SSE 心跳间隔），断掉它们会让界面退化（实测）；而且 HTTP/2 复用一条连接承载多个 stream，断一条等于同时断掉它上面所有在途请求。Clash for Windows 官方文档：默认不会在任何时候主动打断正在进行的连接。想强制把连接清掉重来用 .\\codex-proxy.ps1 restart。"
+    "//switchDropAll": "切换出口时是否断开旧出口上的全部连接。默认 false = 【不断任何连接】，跟 Clash 系一致：新建的连接立刻走新出口，已建立的原样留在旧出口直到它们自己结束。为什么默认不断：从代理这一层根本分不清“长时间在等消息”和“卡住了”——两者都是没有数据。Codex 有的是合法地长时间无数据的请求（等用户批准、等工具执行、SSE 心跳间隔），断掉它们会让界面退化（实测）；而且 HTTP/2 复用一条连接承载多个 stream，断一条等于同时断掉它上面所有在途请求。Clash for Windows 官方文档：默认不会在任何时候主动打断正在进行的连接。想强制把连接清掉重来用 .\\codex-proxy.ps1 restart。",
+    "switchOffDownDrop": false,
+    "//switchOffDownDrop": "true = 完全照 Clash 系：任何情况下都不主动断开已建立的连接，让应用自己超时。默认 false —— 判 DOWN 时仍会断掉挂在该出口上的连接。为什么默认断：应用对两种失败的反应不同 —— 连接被关闭时请求没发出去，应用会【在新连接上自动重发】（Chromium 官方变更：Retry requests on reused sockets that receive ERR_EMPTY_RESPONSE）；而 TCP 超时时应用不知道请求是否已被处理，【不敢重发】，只能报错让你手动重试。所以干等超时并不会更安全。想完全照 Clash 干等就把这个设成 true。"
   },
   "codex": {
     "//": "Codex 路径。两个都留空即可 —— 脚本会自动定位。",

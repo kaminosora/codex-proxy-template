@@ -109,6 +109,9 @@ function loadConfig() {
     // 出口被判 DOWN 时的宽限：0 = 全断。判 DOWN 意味着连握手都不通，
     // 上面的连接不可能恢复，留着只会让界面继续等（"呆住"的成因）。
     downDropGraceMs: 0,
+    // true = 完全照 Clash 系：任何情况下都不断开已建立的连接，让应用自己超时。
+    // 默认 false（判 DOWN 时仍断）—— 见 applyUplink 里那段"应用对两种失败反应不同"的论证。
+    switchOffDownDrop: false,
     latencyTarget: { host: 'speed.cloudflare.com', path: '/__down?bytes=1' },
     ...(c.health || {}),
   };
@@ -1968,12 +1971,32 @@ class Daemon {
     //
     // 这一支用【零宽限】：出口判 DOWN 意味着连握手都不通了，那上面的连接
     // 不可能再恢复，留着只会让界面继续等（正是"呆住"的成因）。
-    for (const l of this.uplinks) {
-      const h = this.health.get(l.name);
-      if (h && h.ok === false) {
-        this.bridge.dropConnectionsOnUplink(l.name, '该出口被判不健康', {
-          graceMs: this.cfg.health.downDropGraceMs ?? 0,
-        });
+    // 判 DOWN 时断连 —— 这一步是【有意保留】的，理由经过查证：
+    //
+    //   应用（Chromium/Codex）对两种失败的反应完全不同：
+    //     · 连接被关闭（ERR_CONNECTION_CLOSED / ERR_EMPTY_RESPONSE / RESET）
+    //       → 请求【没发出去】，应用会【在新连接上自动重发】（Chromium 官方
+    //         变更记录：Retry requests on reused sockets that receive ERR_EMPTY_RESPONSE）
+    //     · TCP 超时（ERR_TIMED_OUT）
+    //       → 应用【不知道请求是否已被服务端处理】，所以【不敢重发】，直接报错
+    //
+    //   所以"干等 TCP 超时"并不会更安全 —— 它最后落到"超时"，而超时恰恰是
+    //   应用不会自动恢复的那一类：用户得手动重试或重启应用。
+    //   把它断掉反而是把"2 分钟且要人工干预"换成"立刻且自动恢复"。
+    //
+    //   唯一的风险窗口：响应【正在传输中】时断掉（响应已提交，无法重发）。
+    //   所以判据必须可靠 —— "探测连续失败"是观测事实，不是猜（这与已被删除的
+    //   "按空闲时间断"有本质区别）。
+    //
+    //   想完全照 Clash 系干等（不断任何连接），设 health.switchOffDownDrop = true。
+    if (this.cfg.health.switchOffDownDrop !== true) {
+      for (const l of this.uplinks) {
+        const h = this.health.get(l.name);
+        if (h && h.ok === false) {
+          this.bridge.dropConnectionsOnUplink(l.name, '该出口被判不健康', {
+            graceMs: this.cfg.health.downDropGraceMs ?? 0,
+          });
+        }
       }
     }
     this.writeState();

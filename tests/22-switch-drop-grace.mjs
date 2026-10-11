@@ -95,6 +95,12 @@ const h = M.loadConfig().health;
 //   从代理层分不清"长时间在等消息"和"卡了"，而 HTTP/2 一条连接上还有多个 stream。
 check('默认 switchDropAll = false（切换时不断任何连接）', h.switchDropAll === false, `实际 ${h.switchDropAll}`);
 check('默认 downDropGraceMs = 0（判 DOWN 时全断）', h.downDropGraceMs === 0, `实际 ${h.downDropGraceMs}`);
+// 判 DOWN 时断连【是保留的、有意的】—— 因为应用对两种失败反应不同：
+//   连接被关闭 → 请求没发出去 → 应用在【新连接上自动重发】（Chromium 官方变更：
+//                  Retry requests on reused sockets that receive ERR_EMPTY_RESPONSE）
+//   TCP 超时     → 应用不知道请求是否已被处理 → 【不敢重发】，只能报错让你手动重试
+// 所以"干等超时"并不会更安全。想完全照 Clash 干等就设 switchOffDownDrop = true。
+
 check('两个都能从配置覆盖', (() => {
   const src = M.loadConfig.toString();
   return /switchDropAll/.test(src) && /downDropGraceMs/.test(src);
@@ -102,7 +108,9 @@ check('两个都能从配置覆盖', (() => {
 
 // ---------------------------------------------------------------- 调用方传对了参数
 step('5. 调用方传对了宽限（静态核对）');
+const h2 = M.loadConfig().health;
 const fs = await import('node:fs');
+const cfg2 = fs.readFileSync(path.join(ROOT, 'codex-proxy.config.json'), 'utf8');
 const mjs = fs.readFileSync(path.join(ROOT, 'codex-proxy.mjs'), 'utf8');
 check('切换那一支只在 switchDropAll === true 时才断',
   /if \(prev && this\.cfg\.health\.switchDropAll === true\)/.test(mjs), '');
@@ -111,6 +119,13 @@ check('切换分支里默认不调用 dropConnectionsOnUplink',
   /默认【不断开任何连接】/.test(mjs), '');
 check('判 DOWN 那一支用 downDropGraceMs',
   /dropConnectionsOnUplink\(l\.name, '该出口被判不健康', \{\s*\n?\s*graceMs: this\.cfg\.health\.downDropGraceMs/.test(mjs), '');
+// —— 判 DOWN 断连是有意保留的（理由见下），并留了开关 ——
+check('默认 switchOffDownDrop = false（判 DOWN 时仍断）',
+  h2.switchOffDownDrop === false, `实际 ${h2.switchOffDownDrop}`);
+check('switchOffDownDrop 真的包住了那段断连逻辑',
+  /switchOffDownDrop !== true/.test(mjs), '');
+check('配置里写明了"应用自动重发 vs 超时不重发"的理由',
+  /自动重发/.test(cfg2) && /不敢重发/.test(cfg2), '');
 check('日志区分了"已卡住的连接"与"保留的连接"',
   /主动断开已卡住的连接/.test(mjs) && /保留了 \$\{kept\} 条正在传输的连接/.test(mjs), '');
 
