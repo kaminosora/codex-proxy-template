@@ -106,7 +106,9 @@ step('D. 连接管理（防「界面呆住」）');
   check('空闲连接清理', has('reapIdleConnections(idleMs) {'));
   check('空闲超时可配', 'connIdleTimeoutSec' in cfg.health);
   check('连接表用于断连（Set 记录活动连接）', has('this.conns = new Set()'));
-  check('按连接建立时刻归属出口（分桶统计）', has('this.pipe(client, upstream, up.name)'));
+  // 三处调用点都带上了目标（conns 命令要用它显示"这条连接连的哪儿"）
+  check('按连接建立时刻归属出口（分桶统计，且记录目标）',
+    /this\.pipe\(client, upstream, up\.name, `/.test(mjs) && has('uplinkTotals'));
   check('文档解释了这个设计的原因', documented(/界面.*呆住|呆住/));
 }
 

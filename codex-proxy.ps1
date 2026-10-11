@@ -15,6 +15,7 @@
     .\codex-proxy.ps1 cli            在挂好代理的终端里跑 codex CLI
     .\codex-proxy.ps1 check          实测出口 IP（应为你日本服务器的 IP）
     .\codex-proxy.ps1 status         查看各出口健康状态
+    .\codex-proxy.ps1 conns          看每条活动连接走哪个出口（多路径并行的证据）
     .\codex-proxy.ps1 speed          实测三个出口的真实延迟与下载速度
     .\codex-proxy.ps1 best           立刻切到实测延迟最低的出口
     .\codex-proxy.ps1 stop           停止
@@ -24,7 +25,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('start', 'stop', 'down', 'restart', 'status', 'check', 'app', 'cli', 'env', 'nodes', 'node-test', 'speed', 'best', 'use', 'auto', 'resolve', 'logs', 'test', 'tests', 'help')]
+    [ValidateSet('start', 'stop', 'down', 'restart', 'status', 'conns', 'check', 'app', 'cli', 'env', 'nodes', 'node-test', 'speed', 'best', 'use', 'auto', 'resolve', 'logs', 'test', 'tests', 'help')]
     [string]$Action = 'start',
 
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -408,6 +409,11 @@ switch ($Action) {
     'status' {
         Write-Head '状态'
         $null = Show-Result (Invoke-Proxy -Arguments @('status'))
+    }
+
+    'conns' {
+        Write-Head '活动连接与出口对应关系'
+        $null = Show-Result (Invoke-Proxy -Arguments @('conns'))
     }
 
     'check' {

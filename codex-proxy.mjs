@@ -604,7 +604,7 @@ class Bridge {
       const upstream = await socksConnect(up.port, host, port, 20000);
       client.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
       if (rest.length) upstream.write(rest);
-      this.pipe(client, upstream, up.name);
+      this.pipe(client, upstream, up.name, `${host}:${port}`);
       this.stats.connects++;
     } catch (e) {
       this.stats.errors++;
@@ -635,10 +635,11 @@ class Bridge {
 
       if (method === 'CONNECT') {
         const [host, portStr] = targetRaw.split(':');
-        const upstream = await socksConnect(up.port, host, Number(portStr) || 443, 20000);
+        const upPort = Number(portStr) || 443;
+        const upstream = await socksConnect(up.port, host, upPort, 20000);
         client.write(`${version} 200 Connection established\r\n\r\n`);
         if (rest.length) upstream.write(rest);
-        this.pipe(client, upstream, up.name);
+        this.pipe(client, upstream, up.name, `${host}:${upPort}`);
         this.stats.connects++;
         return;
       }
@@ -652,13 +653,15 @@ class Bridge {
       }
       if (!headers.host) throw new Error('missing Host header');
 
-      const upstream = await socksConnect(up.port, headers.host.split(':')[0], Number(headers.host.split(':')[1]) || 80, 20000);
+      const fwdHost = headers.host.split(':')[0];
+      const fwdPort = Number(headers.host.split(':')[1]) || 80;
+      const upstream = await socksConnect(up.port, fwdHost, fwdPort, 20000);
       const outHeaders = Object.entries(headers)
         .filter(([k]) => k !== 'proxy-connection' && k !== 'proxy-authorization')
         .map(([k, v]) => `${k}: ${v}`);
       upstream.write(`${method} ${target} ${version}\r\n${outHeaders.join('\r\n')}\r\n\r\n`);
       if (rest.length) upstream.write(rest);
-      this.pipe(client, upstream, up.name);
+      this.pipe(client, upstream, up.name, `${fwdHost}:${fwdPort}`);
       this.stats.connects++;
     } catch (e) {
       this.stats.errors++;
@@ -670,7 +673,7 @@ class Bridge {
     }
   }
 
-  pipe(client, upstream, uplinkName) {
+  pipe(client, upstream, uplinkName, target = null) {
     client.setNoDelay(true);
     upstream.setNoDelay(true);
 
@@ -686,7 +689,16 @@ class Bridge {
     tot.lastAt = Date.now();
 
     // ② 记录每条活动连接，以便切换出口时主动终结它们、以及空闲超时兜底清理
-    const rec = { client, upstream, uplink: key, openedAt: Date.now(), lastActivity: Date.now(), peer: peerOf(client), bytes: 0 };
+    //    clientPort 是【客户端连到 17890 时用的那个临时端口】—— 它才是"这条连接"的身份。
+    //    ★ 注意别取错端 ★ client.localPort 是【服务端】那一端（恒等于 17890），
+    //    客户端的临时端口在 client.remotePort（实测踩过：显示出来是 17890，毫无用处）。
+    //    17891/17892/17893 是上游 SOCKS 的监听口，是"出去的方向"，不是回程的落点。
+    const rec = {
+      client, upstream, uplink: key,
+      openedAt: Date.now(), lastActivity: Date.now(),
+      peer: peerOf(client), bytes: 0, target,
+      clientPort: (() => { try { return client.remotePort ?? null; } catch { return null; } })(),
+    };
     this.conns.add(rec);
 
     const touch = () => { rec.lastActivity = Date.now(); };
@@ -2053,6 +2065,18 @@ class Daemon {
         ...this.health.get(l.name),
       })),
       stats: this.bridge.stats,
+      // 活动连接明细 —— 供 conns 命令展示"哪条连接走哪个出口"。
+      // 这是回答"多条长连接能不能走不同路径"的直接证据：
+      // 同一时刻不同连接可以挂在不同出口上，各自独立。
+      conns: [...this.bridge.conns].slice(0, 200).map((r) => ({
+        clientPort: r.clientPort,
+        target: r.target,
+        peer: r.peer,
+        uplink: r.uplink,
+        bytes: r.bytes,
+        idleMs: Date.now() - r.lastActivity,
+        ageMs: Date.now() - r.openedAt,
+      })),
       // 性能判定的当前状态 —— 让 status 能回答"为什么还没切"：
       //   reason=pending 表示正在累计（streak/need），cooldown 表示在冷静期
       latencyDecision: this.lastDecision || null,
@@ -2390,6 +2414,62 @@ function cmdStop() {
     console.log(`已发送停止信号 (pid ${pid})`);
     return 0;
   })();
+}
+
+function cmdConns() {
+  const pid = daemonPid();
+  const st = readJsonSafe(STATE_FILE);
+  if (!pid) { console.log('状态：未运行'); return 1; }
+  if (!st) { console.log('（暂无状态文件）'); return 0; }
+
+  const list = st.conns || [];
+  console.log('');
+  console.log(`当前活动连接：${list.length} 条   出口：${st.activeUplink ?? '无'}`);
+  console.log('');
+
+  if (!list.length) {
+    console.log('  （暂无）—— Codex 只在需要时才建连，空闲时会全部关闭。');
+    console.log('  想让这里有东西：先 \`.\\codex-proxy.ps1 app\` 起 Codex，再跑本命令。');
+    console.log('');
+    return 0;
+  }
+
+  // 按出口分组 —— 一眼看出"是不是真的多条路径并行"
+  const groups = new Map();
+  for (const c of list) {
+    if (!groups.has(c.uplink)) groups.set(c.uplink, []);
+    groups.get(c.uplink).push(c);
+  }
+
+  console.log('  出口            条数   客户端端口（Codex 连 17890 时用的临时端口）');
+  console.log('  ' + '-'.repeat(72));
+  for (const [up, arr] of groups) {
+    const ports = arr.map((c) => c.clientPort ?? '?').join(' ');
+    console.log('  ' + String(up).padEnd(15) + String(arr.length).padEnd(7) + ports);
+  }
+  console.log('');
+  console.log('  明细（按已传字节降序，只列前 25 条）：');
+  console.log('  客户端端口 出口            已传       空闲     存活     对端');
+  console.log('  ' + '-'.repeat(76));
+  for (const c of [...list].sort((a, b) => (b.bytes || 0) - (a.bytes || 0)).slice(0, 25)) {
+    console.log(
+      '  ' + String(c.clientPort ?? '?').padEnd(11) +
+      String(c.uplink).padEnd(15) +
+      fmtBytes(c.bytes || 0).padEnd(11) +
+      (Math.round((c.idleMs || 0) / 1000) + 's').padEnd(8) +
+      (Math.round((c.ageMs || 0) / 1000) + 's').padEnd(8) +
+      (c.target || '(未标注目标)')
+    );
+  }
+  console.log('');
+  console.log('  ★ 这就是"多条长连接能不能同时走不同路径"的答案：');
+  console.log('    上表按出口分组 —— 如果同时出现两个及以上出口，说明它们【正在并行工作】。');
+  console.log('    每条连接在建立时选定出口，之后不再变（TCP 四元组固定），');
+  console.log('    回程按 socket 配对回来，不经过端口号。');
+  console.log('    出口端口 17891/17892/17893 是【上游 SOCKS 的监听口】，是出去的方向，');
+  console.log('    不是回程的落点。详见故障排查与说明.md 第十一节。');
+  console.log('');
+  return 0;
 }
 
 function cmdStatus() {
@@ -3210,6 +3290,7 @@ async function main() {
     case 'down': return await cmdDown(cfg);
     case 'restart': await cmdStop(); await sleep(1500); return await cmdStart(cfg);
     case 'status': return cmdStatus();
+    case 'conns': return cmdConns();
     case 'check': return await cmdCheck(cfg, argv);
     case 'speed': return await cmdSpeed(cfg, argv);
     case 'best': return await cmdBest(cfg, argv);
@@ -3225,7 +3306,7 @@ async function main() {
       return 0;
     }
     default:
-      console.log('用法: node codex-proxy.mjs <daemon|start|stop|down|restart|status|check|run|app|env|speed|best|use|auto|nodes|node-test|resolve>');
+      console.log('用法: node codex-proxy.mjs <daemon|start|stop|down|restart|status|conns|check|run|app|env|speed|best|use|auto|nodes|node-test|resolve>');
       return 2;
   }
 }
