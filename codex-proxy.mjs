@@ -100,11 +100,12 @@ function loadConfig() {
     //     ① 空闲超过本值  ② 从未传过任何字节（或在 connIdleMaxSec 之上）
     connIdleTimeoutSec: 0,
     connIdleMaxSec: 1800,       // 开启清理时，传过数据的连接的上限兜底
-    // 切换出口时断开旧连接的"宽限"：只有空闲超过这么久（毫秒）的连接才算"卡住"、才断。
-    // 为什么要宽限：Codex 是 Chromium，无条件断连会把它的在途请求腰斩，
-    // 界面退化成「Couldn't load workspace settings」（用户实测报告）。
-    // 留着正在传输的连接，卡住的（lastActivity 不动）照样清掉。
-    switchDropGraceMs: 1500,
+    // 切换出口时是否断开旧连接：默认 false =【不断任何连接】，跟 Clash 系一致。
+    // 新建的连接立刻走新出口，已建立的原样留着直到它们自己结束。
+    // 为什么不断：从代理层分不清"长时间在等消息"和"卡住了"（都是没数据），
+    // 而断错的代价是界面退化 —— 见 applyUplink 里那段注释的三条证据。
+    // 想强制清掉重来：restart。要旧行为（切换即全断）就设 true。
+    switchDropAll: false,
     // 出口被判 DOWN 时的宽限：0 = 全断。判 DOWN 意味着连握手都不通，
     // 上面的连接不可能恢复，留着只会让界面继续等（"呆住"的成因）。
     downDropGraceMs: 0,
@@ -719,36 +720,31 @@ class Bridge {
   }
 
   /**
-   * 主动终结仍挂在指定出口上的连接。
+   * 主动终结仍挂在指定出口上的连接。**只在一种情况调用：该出口被判 DOWN。**
    *
-   * ★ 为什么这一步必须有 ★
-   *   Codex（Chromium）会复用已建立的长连接（WebSocket / HTTP/2）发请求。
-   *   出口延迟爆炸时，连接并不会断开，只是"卡住不动" —— 我们把这种"卡住"如实转达给
-   *   Codex，它便认为"连接还活着，只是慢"，于是继续等，界面就呆住了。
-   *   而且它会一直复用那条连接，**哪怕我们已经把出口切到了健康的另一条** ——
-   *   所以"切换出口"对已经卡住的界面完全无效，只能重启应用（实测踩过）。
+   * ★ 为什么不用于"切换出口" ★
+   *   切换时也断连，我试过两版，都是错的：
+   *     ① 无条件全断 —— 腰斩在途请求，界面退化成
+   *        「Couldn't load workspace settings / Retry to continue chatting」
+   *     ② 只断"空闲超过 1.5 秒"的 —— 论证是"这种多半已卡在旧出口"，
+   *        但这个论证**没有依据**：从代理这一层，"长时间在等消息"和"卡住了"
+   *        完全一样，都是没有数据。Codex 有的是合法地长时间无数据的请求
+   *        （等用户批准、等工具执行、SSE 心跳间隔）。而 HTTP/2 把多个 stream
+   *        复用在同一条连接上，断一条等于同时断掉上面**所有**在途请求。
+   *   所以切换时**一条都不动**，跟 Clash 系一致（官方文档：默认不会在任何时候
+   *   主动打断正在进行的连接）。只有新建的连接走新出口。
    *
-   *   只有把这些连接关掉，Codex 才会重新建连，而新建的连接会走新出口，界面立刻恢复。
+   * ★ 为什么"判 DOWN"时可以断 ★
+   *   因为那不是猜：探测连续 failThreshold 次失败（连 SOCKS/HTTP 握手都不通）
+   *   才会判 DOWN。上面的连接**不可能**再恢复，留着只会让界面继续干等 ——
+   *   这正是"切了出口界面还是呆住"的成因（实测踩过）。
+   *
+   * graceMs 可选：只断空闲超过它（毫秒）的连接。判 DOWN 时传 0（全断）。
    */
   dropConnectionsOnUplink(uplinkName, why, opts = {}) {
-    // ★ 只断开"已经卡住"的连接，不动正在传输的 ★
-    //
-    // 踩过的坑（用户实测报告）：原来是无条件 destroy 该出口上的**每一条**连接，
-    // 结果**每次切出口都把 Codex 的在途请求砍断** —— 表现为界面突然退化成
-    // 「Couldn't load workspace settings / Retry to continue chatting」，
-    // 或者停在加载态。用户的原话："看 codex 弹窗基本上就相当于是断连了"。
-    //
-    // 而真正需要断的只是"卡住不动"的那些。两者的判据现成就有：
-    //   rec.lastActivity 在每次收发数据时都会更新（见 pipe 里的 touch()）。
-    //   正在传输 → lastActivity 是刚刚；上游黑洞 → lastActivity 停在那里不动。
-    //
-    // 所以：空闲超过 graceMs 的才断。这样
-    //   · 正在跑的请求能跑完（不再被腰斩）
-    //   · 卡住的连接照样被清掉（原 bug 的修复效果保留）
-    //   · 之后 Codex 复用旧连接时会发现它已被关闭，于是自然重连到新出口
-    const graceMs = Number.isFinite(opts.graceMs)
-      ? opts.graceMs
-      : (this.cfg?.health?.switchDropGraceMs ?? 1500);
+    // graceMs = 0（默认）表示全断；正数表示只断空闲超过它的。
+    // 调用方全部显式传参，所以这里的默认值只影响直接调用（测试）。
+    const graceMs = Number.isFinite(opts.graceMs) ? opts.graceMs : 0;
     const now = Date.now();
     let dropped = 0, kept = 0, keptBytes = 0;
     for (const rec of [...this.conns]) {
@@ -1926,13 +1922,30 @@ class Daemon {
       this.activeUplink = next;
       const ms = this.health.get(next.name)?.lastMs;
       log('info', `出口切换：${prev ? prev.name : '无'} -> ${next.name}（${ms ?? '?'}ms）`);
-      // 切换时用【宽限】：只断开已经卡住的，不腰斩正在传输的请求。
-      // 用户实测报告：无条件断连会让 Codex 界面退化成
-      // 「Couldn't load workspace settings / Retry to continue chatting」。
-      if (prev) {
-        this.bridge.dropConnectionsOnUplink(prev.name, '切换出口', {
-          graceMs: this.cfg.health.switchDropGraceMs ?? 1500,
-        });
+      // ★ 切换时默认【不断开任何连接】—— 跟 Clash 系一致 ★
+      //
+      // 为什么不带"空闲宽限"地断（我原来就是那么做的，是错的）：
+      //   从代理这一层，**"长时间在等消息"和"卡住了"完全一样 —— 都是没有数据**。
+      //   我原来写的"空闲 > 1.5 秒的多半已卡在旧出口"是**没有依据的假设**：
+      //   Codex 有的是合法地长时间无数据的请求（等用户批准一个操作、等工具执行、
+      //   SSE 心跳间隔），把它们断掉就是又一次"替用户猜"。
+      //   而且更糟：HTTP/2 把多个 stream 复用在同一条连接上，
+      //   杀掉一条连接等于同时杀掉它上面**所有**在途请求。
+      //
+      // Clash 系怎么做的（三条独立证据）：
+      //   · Clash for Windows 官方文档：默认不会在任何时候主动打断正在进行的连接，
+      //     连接会被保持到主动断开（Break When Proxy Change 默认 None）
+      //   · Clash 控制器 API 文档：切换组成员后 existing connections **may continue
+      //     until they close**，只有新连接走新节点；并明确写了
+      //     "Current group member does not prove existing connections were migrated"
+      //   · 用户本机 Clash Party 的 mihomo.yaml 里没有任何断连设置
+      //
+      // 于是正确做法就是：**新建的连接走新出口，已建立的一律不动**。
+      // 卡住的连接交给应用自己的超时；想强制重来就 restart。
+      // 确实需要旧行为（切换即全断）就设 health.switchDropAll = true。
+      if (prev && this.cfg.health.switchDropAll === true) {
+        log('warn', 'health.switchDropAll = true —— 切换时断开旧出口上的全部连接（默认关闭）');
+        this.bridge.dropConnectionsOnUplink(prev.name, '切换出口', { graceMs: 0 });
       }
     } else {
       this.activeUplink = next;

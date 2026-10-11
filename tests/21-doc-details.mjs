@@ -79,10 +79,10 @@ step('B. 跨文档链接指向的文件都存在');
 step('C. 文档里贴的代码片段与实现一致');
 {
   // 故障排查第十节贴的"修复"片段
-  check('第十节贴的 dropConnectionsOnUplink 调用与实现一致（含宽限参数）',
-    /dropConnectionsOnUplink\(prev\.name, '切换出口', \{/.test(mjs) &&
+  check('第十节贴的 dropConnectionsOnUplink 调用与实现一致（切换默认不断）',
+    /switchDropAll/.test(mjs) &&
     /dropConnectionsOnUplink\(l\.name, '该出口被判不健康', \{/.test(mjs) &&
-    /switchDropGraceMs/.test(DOCS['故障排查与说明.md']) &&
+    /switchDropAll/.test(DOCS['故障排查与说明.md']) &&
     /downDropGraceMs/.test(DOCS['故障排查与说明.md']),
     '文档片段必须跟实现一起改，否则读者照着想会被带偏');
 

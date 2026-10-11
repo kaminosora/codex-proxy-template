@@ -92,11 +92,12 @@ step('C. 出口选择与自动切换');
 // ================================================================ D. 连接管理（界面呆住）
 step('D. 连接管理（防「界面呆住」）');
 {
-  // 判据要精确到"带宽限"：无条件全断会把 Codex 的在途请求腰斩（界面退化的成因），
-  // 所以正确行为是"只断卡住的"—— 断言必须跟上，否则这条会变成"看着过、其实在测旧行为"。
-  check('切换出口时断开旧出口连接（带宽限，不腰斩在途）',
-    has("dropConnectionsOnUplink(prev.name, '切换出口', {") &&
-    has('switchDropGraceMs'));
+  // ★ 语义改过两次，这里测的是最终结论 ★
+  //   ① 无条件全断 → 腰斩在途请求 → 界面退化
+  //   ② 带宽限只断"空闲"的 → 但代理层分不清"在等消息"和"卡了"，仍是猜
+  //   ③ 最终：默认【不断任何连接】，跟 Clash 系一致；只有显式开启才全断
+  check('切换出口时默认不断任何连接（跟 Clash 系一致）',
+    has('switchDropAll') && has("if (prev && this.cfg.health.switchDropAll === true)"));
   check('出口被判 DOWN 时全断（不放宽限）',
     has("dropConnectionsOnUplink(l.name, '该出口被判不健康', {") &&
     has('downDropGraceMs'));

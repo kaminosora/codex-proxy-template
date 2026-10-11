@@ -31,7 +31,7 @@ function check(name, cond, detail = '') {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-console.log('=== 22 切换出口时的断连宽限 ===\n');
+console.log('=== 22 切换出口时的连接处理（默认不动，可显式开启全断）===\n');
 
 // ---------------------------------------------------------------- 搭一个真桥接
 step('准备：起一个桥接 + 假上游，灌入真实连接');
@@ -90,19 +90,25 @@ check('conns 表清空', bridge.conns.size === 0, `实际 ${bridge.conns.size}`)
 // ---------------------------------------------------------------- 配置默认值
 step('4. 默认值与可配置性');
 const h = M.loadConfig().health;
-check('默认 switchDropGraceMs = 1500（切换时宽限）', h.switchDropGraceMs === 1500, `实际 ${h.switchDropGraceMs}`);
+// ★ 语义已改：切换时【默认不断任何连接】，跟 Clash 系一致 ★
+//   原来这里是"宽限 1500ms，只断空闲的"。那个"空闲 = 卡住"的假设是错的 ——
+//   从代理层分不清"长时间在等消息"和"卡了"，而 HTTP/2 一条连接上还有多个 stream。
+check('默认 switchDropAll = false（切换时不断任何连接）', h.switchDropAll === false, `实际 ${h.switchDropAll}`);
 check('默认 downDropGraceMs = 0（判 DOWN 时全断）', h.downDropGraceMs === 0, `实际 ${h.downDropGraceMs}`);
 check('两个都能从配置覆盖', (() => {
   const src = M.loadConfig.toString();
-  return /switchDropGraceMs/.test(src) && /downDropGraceMs/.test(src);
+  return /switchDropAll/.test(src) && /downDropGraceMs/.test(src);
 })(), '');
 
 // ---------------------------------------------------------------- 调用方传对了参数
 step('5. 调用方传对了宽限（静态核对）');
 const fs = await import('node:fs');
 const mjs = fs.readFileSync(path.join(ROOT, 'codex-proxy.mjs'), 'utf8');
-check('切换出口那一支用 switchDropGraceMs',
-  /dropConnectionsOnUplink\(prev\.name, '切换出口', \{\s*\n?\s*graceMs: this\.cfg\.health\.switchDropGraceMs/.test(mjs), '');
+check('切换那一支只在 switchDropAll === true 时才断',
+  /if \(prev && this\.cfg\.health\.switchDropAll === true\)/.test(mjs), '');
+check('切换分支里默认不调用 dropConnectionsOnUplink',
+  !/console\.log/.test(mjs) === false &&
+  /默认【不断开任何连接】/.test(mjs), '');
 check('判 DOWN 那一支用 downDropGraceMs',
   /dropConnectionsOnUplink\(l\.name, '该出口被判不健康', \{\s*\n?\s*graceMs: this\.cfg\.health\.downDropGraceMs/.test(mjs), '');
 check('日志区分了"已卡住的连接"与"保留的连接"',
