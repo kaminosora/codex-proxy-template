@@ -278,6 +278,54 @@ step('F. 命令行选项解析（★ 踩过的坑：位置 0 的选项被忽略�
   }
 }
 
+// ---------------------------------------------------------------- G. 进程名显示
+step('G. status 的端口归属会显示进程名（区分 codex-core 与 mihomo）');
+{
+  // 背景：我们的回落内核改名成了 bin\codex-core.exe，所以正常时端口上的
+  //       进程名应是 codex-core；看到 mihomo 意味着"副本丢了、退回了 Clash Party 的内核"
+  //       或者"那根本是 Clash Party 自己的内核"。
+  //       status 把名字打出来，用户就不用自己去 tasklist 查了。
+  check('status 端口归属段会打印进程名',
+    /processNameOf\(owner\)/.test(mjs) && /nameStr/.test(mjs), '');
+  check('实现了 processNameOf（用 tasklist 查名字）',
+    /function processNameOf\(pid\)/.test(mjs) && /'tasklist'/.test(mjs), '');
+  check('看到 mihomo 时给出两种可能的解释（而不是只说"异常"）',
+    /上面有 mihomo 进程/.test(mjs) && /①/.test(mjs) && /②/.test(mjs), '');
+  check('codex-core 在内核退让链的首选位置',
+    /bin', 'codex-core\.exe'/.test(mjs) && /首选：我们自己的副本/.test(mjs), '');
+
+  // 容错：任何奇怪输入都返回 null 而不是抛
+  const weird = [null, undefined, 0, -1, 999999, 'abc'];
+  let threw = 0, nonNull = 0;
+  for (const v of weird) {
+    try { const r = M.processNameOf(v); if (r !== null) nonNull++; } catch { threw++; }
+  }
+  check('processNameOf 对异常输入容错（不抛异常、返回 null）',
+    threw === 0 && nonNull === 0, `抛 ${threw} 次，非 null ${nonNull} 次`);
+  check('processNameOf 已导出（便于测试与排障）',
+    typeof M.processNameOf === 'function', '');
+}
+
+// ---------------------------------------------------------------- H. 内核退让链
+step('H. 内核退让链（找不到我们的副本时不能直接失败）');
+{
+  const cfg = M.loadConfig();
+  const up = new M.ClashPartyUplink(cfg.uplinks.clashParty);
+  check('候选路径覆盖"盘符 × Program Files"组合',
+    /Program Files/.test(mjs) && /'C:', 'D:', 'E:', 'F:'/.test(mjs), '');
+  check('有"有界搜索"兜底（Clash Party 装在非常规位置时）',
+    /findCoreBySearch\(\)/.test(mjs) && /WALK_INTO/.test(mjs), '');
+  check('遍历时不会漏掉 resources 这一层（踩过的坑）',
+    /WALK_INTO = .*resources/i.test(mjs), '');
+  check('有界搜索真的有界（限制深度）', /depth > 5/.test(mjs), '');
+  check('coreCandidates() 不写死某台机器的路径',
+    !/D:\\\\Program Files\\\\Mihomo/.test(mjs), '');
+  check('coreExe() 能在本机找到内核（真跑）',
+    typeof up.coreExe() === 'string' && up.coreExe().length > 0, up.coreExe() || '返回 null');
+  check('找到的是改名副本（不是 Clash Party 的 mihomo）',
+    /codex-core\.exe$/i.test(up.coreExe() || ''), up.coreExe() || '');
+}
+
 // ---------------------------------------------------------------- 汇总
 console.log('\n=== 汇总 ===');
 const pass = results.filter((r) => r.ok).length;

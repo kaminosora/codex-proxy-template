@@ -8,7 +8,7 @@
 #   2) 重复 start 是幂等的（不会起第二个守护进程）
 #   3) stop 之后守护进程退出
 #   4) stop 之后 4 个端口全部释放
-#   5) stop 之后没有孤儿子进程（ssh / xray / mihomo）
+#   5) stop 之后没有孤儿子进程（codex-core / mihomo / xray / ssh —— 见 $OurProcessNames）
 #   6) 强杀守护进程后，start 能自动认领并清理残留
 #   7) 最终状态干净（端口全释放、无孤儿）
 #
@@ -35,28 +35,42 @@ function ListeningPorts {
         ForEach-Object { if ($_.Line -match ':(\d+)\s+\S+\s+LISTENING\s+(\d+)') { [pscustomobject]@{ Port = [int]$Matches[1]; Pid = [int]$Matches[2] } } } |
         Where-Object { $PORTS -contains $_.Port })
 }
+# ★ 该按哪些进程名找我们的子进程 ★
+#
+# 事实（实测确认）：我们的回落内核是 bin\codex-core.exe，所以它的**进程名是 codex-core**，
+# 不是 mihomo。早期这份检测写的是 `xray, mihomo, ssh`，于是：
+#   - 抓不到我们自己的 codex-core 孤儿（**漏检**，这是更严重的问题）
+#   - 反而会抓到 Clash Party 自己的 mihomo（**误报**）
+# 两个方向都错。所以必须把 codex-core 列进来。
+#
+# 为什么仍然保留 mihomo：ClashPartyUplink.coreExe() 有两条路径 ——
+#   首选 bin\codex-core.exe；**找不到时才退回 Clash Party 自带的 mihomo.exe**（并打警告）。
+# 那种情况下我们起的进程名就是 mihomo。所以两个名字都要查。
+#
+# 与"排除 Clash Party 内核"的关系：靠开头拍的 PID 快照区分（见 SnapshotPreexisting），
+# 不靠名字 —— 因为名字上两者无法区分。
+$Script:OurProcessNames = @('codex-core', 'mihomo', 'mihomo-alpha', 'mihomo-smart', 'xray', 'ssh')
+
 function OrphanChildren {
-    # 我们的三个出口子进程名
-    #
-    # ★ 必须排除"测试开始前就已经存在的同名进程" ★
-    #   踩过的坑：**Clash Party 自己的内核进程名就是 mihomo**。用户开着 Clash Party
-    #   跑本测试时，检查项 5 会把它报成"残留: mihomo#3844"，然后 7 也跟着挂 —— 两个
-    #   假失败，看起来像我们 stop 之后留了孤儿，其实那是人家的进程。
-    #
-    #   做法：在测试开头（我们还没起任何东西时）先给同名进程拍个 PID 快照，
-    #   之后只把"不在快照里的"算作孤儿。这样既不误报，也不放松判据。
-    @(Get-Process -Name xray, mihomo, ssh -ErrorAction SilentlyContinue |
+    # 我们的三个出口子进程（按进程名找，再排除"测试开始前就存在的"）
+    #   排除理由见 SnapshotPreexisting 的注释：Clash Party 自己的内核也叫 mihomo，
+    #   名字上区分不了，只能靠"它在我们起东西之前就在了"来排除。
+    @(Get-Process -Name $Script:OurProcessNames -ErrorAction SilentlyContinue |
         Where-Object { -not $Script:PreexistingPids.Contains($_.Id) })
 }
 function SnapshotPreexisting {
     $Script:PreexistingPids = @{}
-    foreach ($p in @(Get-Process -Name xray, mihomo, ssh -ErrorAction SilentlyContinue)) {
+    foreach ($p in @(Get-Process -Name $Script:OurProcessNames -ErrorAction SilentlyContinue)) {
         $Script:PreexistingPids[$p.Id] = $p.ProcessName
     }
+    $names = $Script:OurProcessNames -join ' / '
+    Write-Host "  查找的进程名: $names" -ForegroundColor DarkGray
     if ($Script:PreexistingPids.Count) {
         $desc = ($Script:PreexistingPids.GetEnumerator() | ForEach-Object { "$($_.Value)#$($_.Key)" }) -join ', '
         Write-Host "  说明：测试开始前已有同名进程（会排除，不算我们的孤儿）：$desc" -ForegroundColor DarkGray
-        Write-Host '        （多半是 Clash Party 自己的内核，它的进程名就是 mihomo）' -ForegroundColor DarkGray
+        Write-Host '        （多半是 Clash Party 自己的内核 —— 它的进程名就是 mihomo）' -ForegroundColor DarkGray
+    } else {
+        Write-Host '  说明：测试开始前没有同名进程，之后出现的都会算作我们的' -ForegroundColor DarkGray
     }
 }
 function DaemonOf {
@@ -108,7 +122,7 @@ Check '四个端口全部释放' ($l4.Count -eq 0) "仍占用: $((($l4 | ForEach
 # ---------------------------------------------------------------- 5
 Step '5. stop 后无孤儿子进程'
 $orphans = OrphanChildren
-Check '没有 xray / mihomo / ssh 孤儿' ($orphans.Count -eq 0) $(if ($orphans.Count) { "残留: " + (($orphans | ForEach-Object { "$($_.ProcessName)#$($_.Id)" }) -join ', ') } else { '' })
+Check '没有 codex-core / mihomo / xray / ssh 孤儿' ($orphans.Count -eq 0) $(if ($orphans.Count) { "残留: " + (($orphans | ForEach-Object { "$($_.ProcessName)#$($_.Id)" }) -join ', ') } else { '' })
 
 # ---------------------------------------------------------------- 6
 Step '6. 强杀守护进程后能否自动恢复'

@@ -962,6 +962,34 @@ function portOpen(port) {
 
 /** 极简 YAML 扫描：只提取 proxies 段里 name/type/server/port/... 这些扁平字段 */
 /**
+ * 查某个 pid 的**进程名**（只看名字，不看路径）。
+ *
+ * 为什么要这个：我们的回落内核是改名过的 `bin\codex-core.exe`，所以正常时
+ * 端口上的进程名应该是 **`codex-core`**；一旦看到 `mihomo`，要么是
+ *   ① 我们的副本丢了、退回了 Clash Party 的内核（要补副本），
+ *   ② 要么那根本是 Clash Party 自己的内核占了端口（与我们无关）。
+ * `status` 把名字打出来，用户就能一眼区分，不用自己去 tasklist。
+ *
+ * 用 `tasklist /FI "PID eq N" /FO CSV /NH` —— 比 PowerShell 轻，
+ * 且在受限环境下失败也只是返回 null（显示成"名字未知"），不影响主流程。
+ */
+function processNameOf(pid) {
+  if (!pid) return null;
+  try {
+    if (process.platform !== 'win32') return null;
+    const out = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
+      { encoding: 'utf8', windowsHide: true });
+    if (out.error || !out.stdout) return null;
+    // 形如： "codex-core.exe","12345","Console","1","45,123 K"
+    const m = out.stdout.match(/^"([^"]+)"/m);
+    if (!m) return null;
+    return m[1].replace(/\.exe$/i, '');   // 去掉 .exe，与 Get-Process 的 ProcessName 对齐
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 找出监听某端口的进程 PID（Windows 用 netstat，其它平台用 lsof）。
  *
  * ⚠️ 可能返回 null 即使端口确实被占 —— 受限沙箱里 `spawnSync` 会直接 EPERM，
@@ -1260,8 +1288,20 @@ class ClashPartyUplink {
     // 退路：Clash Party 自带的 mihomo.exe —— 会触发那个检测，只在没有副本时才用
     for (const c of this.coreCandidates()) if (fs.existsSync(c)) {
       log('warn', `回落出口将直接使用 Clash Party 的 mihomo.exe（${c}）—— 可能触发它的"高权限内核"检测弹窗。` +
-        `建议把内核复制一份到 ${mine} 并在配置里指定 clashParty.coreExe`);
+        `建议把内核复制一份到 ${mine}（或跑 bin\\fetch-binaries.ps1）`);
       return c;
+    }
+
+    // 最后一道：有界搜索（Clash Party 装在非常规位置时）
+    //
+    // 为什么需要它：上面那批候选路径是"按惯例猜"的，猜不中就返回 null，
+    // 于是回落出口起不来、而用户只看到一句"找不到内核"。实测这台机器的 Clash Party
+    // 就装在 D 盘 —— 早期靠一条硬编码路径兜住，去掉硬编码后必须有等价的兜底。
+    const found = this.findCoreBySearch();
+    if (found) {
+      log('warn', `按惯例路径没找到内核，搜索后在 ${found} 找到 —— 会触发 Clash Party 的"高权限内核"检测弹窗。` +
+        `强烈建议跑 bin\\fetch-binaries.ps1 把它复制成 ${mine}`);
+      return found;
     }
     return null;
   }
@@ -1270,14 +1310,94 @@ class ClashPartyUplink {
   coreCandidates() {
     const names = ['mihomo.exe', 'mihomo', 'clash-meta.exe', 'clash.exe', 'verge-mihomo.exe'];
     const out = [];
+    // 1) 配置里的数据目录（最权威 —— 用户可以在配置里改）
     for (const n of names) out.push(path.join(this.cfg.dataDir, n), path.join(this.cfg.dataDir, 'sidecar', n));
-    for (const n of ['mihomo.exe']) {
-      out.push(`D:\\Program Files\\Mihomo Party\\Clash Party\\resources\\sidecar\\${n}`);
-      for (const base of [process.env.LOCALAPPDATA, process.env.ProgramFiles, process.env['ProgramFiles(x86)']]) {
-        if (base) out.push(path.join(base, 'Mihomo Party', 'Clash Party', 'resources', 'sidecar', n));
+
+    // 2) Clash Party 的常见安装位置
+    //
+    // ★ 不要写死某台机器的路径 ★
+    //   早期这里硬编码了一条 `D:\Program Files\Mihomo Party\...`（作者机器上的位置），
+    //   对别人毫无用处，而且会把本机路径带进脱敏模板。已去掉。
+    //
+    //   补偿办法（去掉硬编码不能变成"找不到"）：
+    //     a) 环境变量给出的根（LOCALAPPDATA / ProgramFiles / ProgramFiles(x86)）
+    //     b) 常见盘符 + 常见安装目录名（含 Program Files 与直接盘根两种）
+    //     c) 上面都不中时，做一次【有界】目录搜索（只扫两层，见 findCoreBySearch）
+    //   最好的办法其实是把内核复制到 bin\codex-core.exe（bin\fetch-binaries.ps1 一键做），
+    //   本函数只是最后一道退路。
+    const relDirs = [
+      path.join('Mihomo Party', 'Clash Party', 'resources', 'sidecar'),
+      path.join('Mihomo Party', 'Clash Party', 'resources'),
+    ];
+    const roots = [
+      process.env.LOCALAPPDATA,
+      process.env.ProgramFiles,
+      process.env['ProgramFiles(x86)'],
+      // 盘根与"盘符 + Program Files"：实测这台机器就装在 D 盘的 Program Files 下
+      ...['C:', 'D:', 'E:', 'F:'].flatMap((d) => [`${d}\\`, `${d}\\Program Files\\`, `${d}\\Program Files (x86)\\`]),
+    ].filter(Boolean);
+    for (const base of [...new Set(roots)]) {
+      for (const r of relDirs) {
+        for (const n of names) out.push(path.join(base, r, n));
       }
     }
     return out;
+  }
+
+  /**
+   * 有界搜索：在常见根目录下找 `resources\sidecar\mihomo.exe`。
+   *
+   * 只在 coreExe() 的候选路径【全部落空】时才调用 —— 那是"用户的 Clash Party
+   * 装在非常规位置"的情况。深度限制到 4 层、且只看目录名匹配的，避免全盘扫描。
+   */
+  findCoreBySearch() {
+    const fsMod = fs;
+    const roots = [
+      process.env.LOCALAPPDATA,
+      process.env.ProgramFiles,
+      process.env['ProgramFiles(x86)'],
+      // 常见盘符 × 常见安装前缀。必须显式列出"盘符 + Program Files"——
+      // 实测这台机器的 Clash Party 就在 `D:\Program Files\...`，
+      // 只给 `D:\` 是进不去的（虽然理论上能靠遍历下去，但那样会扫整个盘）。
+      ...['C:', 'D:', 'E:', 'F:'].flatMap((d) => [
+        `${d}\\`, `${d}\\Program Files\\`, `${d}\\Program Files (x86)\\`,
+      ]),
+    ].filter(Boolean);
+    const seen = new Set();
+    // ★ 要往下走的目录名 ★
+    //   踩过的坑：原来只写 /mihomo|clash/，结果在最后一层断了 ——
+    //   路径是 `…\Clash Party\resources\sidecar\mihomo.exe`，中间那层叫
+    //   **`resources`**，不含 mihomo/clash，于是遍历不进去、永远返回 null（4ms 就退出）。
+    //   Program Files 同理：D 盘装的话必须能进去。
+    const WALK_INTO = /mihomo|clash|program files|resources/i;
+    const walk = (dir, depth) => {
+      if (depth > 5 || seen.has(dir)) return null;
+      seen.add(dir);
+      let entries;
+      try { entries = fsMod.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+      for (const e of entries) {
+        if (!e.isDirectory()) continue;
+        const p = path.join(dir, e.name);
+        // 命中 sidecar 目录就找内核
+        if (e.name.toLowerCase() === 'sidecar') {
+          for (const n of ['mihomo.exe', 'mihomo', 'clash-meta.exe', 'verge-mihomo.exe']) {
+            const cand = path.join(p, n);
+            if (fsMod.existsSync(cand)) return cand;
+          }
+        }
+        // 只沿着"名字像安装目录"的文件夹往下走（否则会扫爆整块盘）
+        if (WALK_INTO.test(e.name)) {
+          const hit = walk(p, depth + 1);
+          if (hit) return hit;
+        }
+      }
+      return null;
+    };
+    for (const r of [...new Set(roots)]) {
+      const hit = walk(r, 0);
+      if (hit) return hit;
+    }
+    return null;
   }
 
   /**
@@ -2217,11 +2337,29 @@ function cmdStatus() {
     if (!p) continue;
     const owner = pidListeningOn(p);
     if (!owner) { console.log(`  ${String(p).padEnd(6)} ${String(label).padEnd(14)} 无监听`); continue; }
-    if (owner === pid) { console.log(`  ${String(p).padEnd(6)} ${String(label).padEnd(14)} PID=${String(owner).padEnd(7)} 守护进程本身`); continue; }
+    const pname = processNameOf(owner);
+    const nameStr = pname ? pname.padEnd(12) : '(名字未知)'.padEnd(12);
+    if (owner === pid) {
+      console.log(`  ${String(p).padEnd(6)} ${String(label).padEnd(14)} PID=${String(owner).padEnd(7)} ${nameStr} 守护进程本身`);
+      continue;
+    }
     const uplink = (st.uplinks || []).find((u) => u.port === p);
     const isOurs = uplink?.pid && owner === uplink.pid;
     if (!isOurs) foreign++;
-    console.log(`  ${String(p).padEnd(6)} ${String(label).padEnd(14)} PID=${String(owner).padEnd(7)} ${isOurs ? '子进程' : '⚠ 不是我们的子进程（疑似上一轮残留）'}`);
+    console.log(`  ${String(p).padEnd(6)} ${String(label).padEnd(14)} PID=${String(owner).padEnd(7)} ${nameStr} ${isOurs ? '子进程' : '⚠ 不是我们的子进程（疑似上一轮残留）'}`);
+  }
+  // 显示进程名是为了让"是不是我们的"一眼可见：
+  //   codex-core = 我们改过名的回落内核  ← 正常
+  //   mihomo     = 退回用了 Clash Party 的内核（会触发它的高权限检测弹窗），
+  //                或者干脆是 Clash Party 自己的内核占了端口
+  const seenNames = ports.map(([, p]) => (p ? processNameOf(p) : null)).filter(Boolean);
+  if (seenNames.includes('mihomo')) {
+    console.log('');
+    console.log('  ⚠ 上面有 mihomo 进程。两种可能：');
+    console.log('     ① 我们的回落实例退回了 Clash Party 的内核（bin\\codex-core.exe 缺失）——');
+    console.log('        跑 bin\\fetch-binaries.ps1 补上副本即可（不补会触发 Clash Party 的检测弹窗）');
+    console.log('     ② 那是 Clash Party 自己的内核（它的进程名就是 mihomo）—— 与我们无关');
+    console.log('     区分方法：.\\codex-proxy.ps1 stop 后再看这个端口还在不在');
   }
   if (foreign) console.log('  ⚠ 有端口被非本守护进程的子进程占用，建议 stop 后清理再 start');
   return 0;
@@ -2962,6 +3100,7 @@ export {
   reapPreviousChildren,
   recordChildren,
   pidListeningOn,
+  processNameOf,
   canLookupPorts,
   peerOf,
   codexUsingOurProxy,
