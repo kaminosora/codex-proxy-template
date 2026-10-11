@@ -84,6 +84,10 @@ function loadConfig() {
     //   早期把它当高门槛用（800），导致 250~800ms 区间成了永不优化的死区：
     //   600ms vs 300ms 差一倍也放着不动 —— 实测踩过。
     slowMs: 250,
+    // 严重劣化阈值：>= 它就跳过"连续 N 次"的等待、立刻切（默认 1500，0 = 关闭）。
+    // 实测动机：ssh:jp 突然从 297ms 跳到 4318ms 并持续约 4 分钟，
+    // 而默认要等 3 轮 ≈ 45 秒才切 —— 那 45 秒里界面拿不到 workspace 设置。
+    slowHardMs: 1500,
     fastRatio: 2,          // 候选要比当前快这么多倍（相对阈值，与 slowMs 无关）
     minGainMs: 150,        // 且至少快这么多毫秒，避免"50ms→20ms 也切"
     satisfiedPolls: 3,     // 连续满足多少次才切换（3 × 15s ≈ 45 秒）
@@ -474,6 +478,28 @@ function decideLatencySwitch({ healthy, current, health, cfg, prevStreak, cooldo
     if (candMs === null || h.lastMs < candMs) { cand = l; candMs = h.lastMs; }   // 取最快
   }
   if (!cand) return keep('no-better-candidate');
+
+  // 条件 2b：★ 严重劣化时跳过"连续 N 次"的等待，立刻切 ★
+  //
+  // 为什么需要：默认要连续 satisfiedPolls 次（3 × 15s ≈ 45 秒）才切。
+  // 那个延迟是为"细碎的抖动"设计的，但实测遇到过这种情况（用户环境）：
+  //   ssh:jp 在 06:25:33 从 297ms 突然跳到 4318ms，并持续了约 4 分钟，
+  //   而 clash-party 一直稳定在 150~200ms。
+  // 这 45 秒里所有新请求都建立在那条 4 秒延迟的路上 —— 界面的
+  // /accounts/check、/settings/user 之类请求拿不到结果，就显示"无法加载工作空间设置"。
+  //
+  // 判据用**绝对**阈值而不是倍数：绝对"太慢"才说明这条出口已经不适合用；
+  // 倍数会在当前很快时误伤（300ms 的 8 倍是 2400ms，但 300ms 本身并不慢，
+  // 只是没到 slowMs 地板以上太多）。候选仍要满足上面那两条增益条件，
+  // 所以不会"切到另一个同样烂的"。
+  const hardMs = Number(cfg.slowHardMs ?? 0);
+  if (hardMs > 0 && curH.lastMs >= hardMs) {
+    return {
+      switch: true, cand, streak: null,
+      cooldownUntil: now + (cfg.cooldownMs || 120000),
+      curMs: curH.lastMs, candMs, reason: 'switch-hard',
+    };
+  }
 
   // 条件 3b：连续满足 satisfiedPolls 次才真切；中途一次不成立就清零重数。
   // streak 用 { n } 对象而不是裸数字：调用方要能区分"从没满足过（null）"和"计数为 0"。
@@ -1643,8 +1669,11 @@ class ClashPartyUplink {
 // ---------------------------------------------------------------- 守护进程主体
 
 class Daemon {
-  constructor(cfg) {
+  constructor(cfg, preferName = null) {
     this.cfg = cfg;
+    // 启动时挑好的出口（来自 app 的测速）。只作【初始选择】的提示，不钉住 ——
+    // 之后它劣化时健康探测/性能判定照样能切走。
+    this.startupPrefer = preferName;
     this.bridge = new Bridge(() => this.activeUplink);
     this.uplinks = [];
     this.activeUplink = null;
@@ -1734,6 +1763,15 @@ class Daemon {
     fs.writeFileSync(TOKEN_FILE, JSON.stringify({ port, token: this.token, pid: process.pid, startedAt: new Date().toISOString() }, null, 2));
     fs.writeFileSync(PID_FILE, String(process.pid));
 
+    // 启动时挑好的出口先顶上（还没探测过，只是设置初值）
+    if (this.startupPrefer) {
+      const want = this.uplinks.find((l) => l.name === this.startupPrefer);
+      if (want) {
+        this.activeUplink = want;
+        this.slowStreak = null;          // 新的起点，性能计数重新开始
+        log('info', `按启动测速结果先选：${want.name}（未钉住，之后劣化仍会自动切）`);
+      }
+    }
     await this.healthCheckAll(true);
     this.probeTimer = setInterval(() => this.healthCheckAll(false).catch(() => {}), this.cfg.health.intervalMs);
     setInterval(() => this.writeState(), 5000).unref();
@@ -1905,8 +1943,11 @@ class Daemon {
     };
 
     if (d.switch) {
+      const why = d.reason === 'switch-hard'
+        ? `严重劣化（${d.curMs}ms ≥ slowHardMs ${cfg.slowHardMs}ms）—— 跳过等待立刻切`
+        : `连续 ${cfg.satisfiedPolls} 次满足`;
       log('warn', `性能判定切换出口：${current.name}(${d.curMs}ms) -> ${d.cand.name}(${d.candMs}ms)` +
-        `（连续 ${cfg.satisfiedPolls} 次满足，之后 ${Math.round(cfg.cooldownMs / 1000)}s 冷静期）`);
+        `（${why}，之后 ${Math.round(cfg.cooldownMs / 1000)}s 冷静期）`);
       return d.cand;
     }
     // 待定/冷静期也记一条 info —— 这是"为什么还没切"的唯一线索。
@@ -2203,6 +2244,71 @@ async function measureUplink(uplink, { latencySamples = 3, dlBytes = 262144 } = 
   };
 }
 
+// ---------------------------------------------------------------- 启动时挑最优出口
+
+/**
+ * 启动前并发测一遍所有出口的延迟，返回最快的那个名字（失败返回 null）。
+ *
+ * 为什么需要：默认按 `priority` 选第一个健康的出口，而 priority 是**静态顺序**
+ * （ssh:jp=1 → xray:jp=2 → clash-party=3）。但实测经常不是这个顺序：
+ * 用户环境里 `ssh:jp` 那条路会劣化到 3000~4700ms，而 `clash-party` 稳定在 150~200ms。
+ * 于是每次启动都先"用最差的那条"跑到健康探测发现为止。
+ *
+ * 为什么不用 measureUplink：它固定 3 次采样 + 下载 256KB，一次要好几秒到十几秒。
+ * 启动时只需要**排序**，不需要精确值，所以：
+ *   · 只测延迟（不下载）
+ *   · 三路并发（总耗时 ≈ 最慢那条，而不是三条之和）
+ *   · 每条 2 次采样取最小（抖动大时取最小更接近真实能力）
+ *   · 4 秒超时，测不到就当它最差（而不是让启动卡住）
+ *
+ * ⚠️ 只影响【初始选谁】。不钉住（不 pin）—— 之后健康探测发现它劣化仍会自动切走。
+ */
+async function pickBestUplinkAtStartup(cfg) {
+  const u = cfg.uplinks;
+  const list = [];
+  // ★ 端口字段名三个出口各不相同，别想当然 ★
+  //   实测踩过两个 bug（都表现为"测不到"，看着像网络问题，其实是字段读错）：
+  //     ssh        用的是 `socksPort`（17891）；`port` 是【SSH 的 22】——
+  //                读错就去连 127.0.0.1:22，报 connect ECONNREFUSED
+  //     clashParty 配置里【没有 port 字段】，是 `listenPort`（17893）——
+  //                读错就是 undefined，报 "Port should be >= 0 and < 65536"
+  if (u.ssh?.enabled) list.push({ name: 'ssh:jp', port: Number(u.ssh.socksPort ?? 17891), kind: 'ssh' });
+  if (u.xray?.enabled) list.push({ name: 'xray:jp', port: Number(u.xray.port ?? 17892), kind: 'xray' });
+  if (u.clashParty?.enabled) list.push({ name: 'clash-party', port: Number(u.clashParty.listenPort ?? 17893), kind: 'clash' });
+  if (list.length < 2) return { best: null, results: [] };   // 只有一个出口没有"挑"的意义
+
+  const lt = cfg.health.latencyTarget || { host: 'speed.cloudflare.com', path: '/__down?bytes=1' };
+  const one = async (l) => {
+    const samples = [];
+    let lastErr = null;
+    for (let i = 0; i < 2; i++) {
+      // ★ 超时给 6 秒，不要给 4 秒 ★
+      //   实测踩过：4 秒时 ssh:jp / clash-party 偶发"测不到"（那条正好抖一下，
+      //   而同时要跑 2 次采样 + 三路并发）。启动时多等 2 秒无所谓，
+      //   但把一条好路径误判成不可用、进而选错起始出口，代价更大。
+      const r = await requestTiming(l.port, { host: lt.host, path: lt.path, maxBytes: 1, timeoutMs: 6000 });
+      if (r.ok) samples.push(r.totalMs);
+      else lastErr = r.err || '未知失败';
+    }
+    // ★ 失败原因一定要带回去 ★
+    //   早期这里只返回 ms=null，于是"测不到"到底是超时、连不上、还是被拒，
+    //   完全看不出来 —— 排查时只能瞎猜（实测踩过）。
+    return { name: l.name, ms: samples.length ? Math.min(...samples) : null, samples, err: lastErr };
+  };
+  const settled = await Promise.all(list.map((l) => one(l).catch((e) => ({ name: l.name, ms: null, samples: [], err: 'throw: ' + e.message }))));
+
+  // ★ 挑法：能测到的里选最快；一个都测不到就【按 priority 顺序取第一个】★
+  //
+  //   为什么不能简单地把"测不到"当最差：万一条条都测不到，就会选出一个
+  //   我们其实一无所知的"最差"；那时按配置里的 priority 顺序选更合理
+  //   （= 与不做测速时的行为一致，不会更糟）。
+  const ok = settled.filter((r) => r.ms !== null);
+  const best = ok.length
+    ? ok.reduce((a, b) => (b.ms < a.ms ? b : a)).name
+    : (list.length ? list[0].name : null);   // list 本就是按 priority 排的
+  return { best, results: settled, measured: ok.length };
+}
+
 // ---------------------------------------------------------------- 命令
 
 /**
@@ -2303,7 +2409,9 @@ function sendControl(cmd, args = null, timeoutMs = 6000) {
 
 async function cmdDaemon(cfg) {
   openLog();
-  const d = new Daemon(cfg);
+  // 启动时挑好的出口由 app 通过环境变量传入（子进程能继承到）
+  const prefer = (process.env.CODEX_PROXY_STARTUP_PREFER || '').trim() || null;
+  const d = new Daemon(cfg, prefer);
   process.on('SIGINT', () => d.shutdown());
   process.on('SIGTERM', () => d.shutdown());
   process.on('uncaughtException', (e) => log('error', 'uncaught: ' + (e?.stack || e)));
@@ -2827,6 +2935,32 @@ async function cmdApp(cfg, argv = []) {
   const prefer = argOf('--prefer') || cfg.codex?.desktopPrefer || 'registered';
   const desVer = argOf('--desktop-version');
   const exeArg = argOf('--desktop-exe');
+
+  // ★ 启动时先挑最优出口 ★
+  //
+  // 为什么：默认按 priority 静态顺序选（ssh:jp=1 → xray:jp=2 → clash-party=3），
+  // 但实测经常不是这个顺序 —— 用户环境里 ssh:jp 会劣化到 3000~4700ms，
+  // 而 clash-party 稳定在 150~200ms。不挑的话每次启动都先用最差的那条，
+  // 要等约 45 秒健康探测才换走，这期间界面就在一条慢路上。
+  //
+  // 只在"守护进程本来没在跑"时挑：已经在跑的话换初始出口没有意义。
+  // `--no-pick` 可跳过。
+  let picked = null;
+  if (cfg.codex?.startupPickBest !== false && !argv.includes('--no-pick') && !daemonPid()) {
+    console.log('正在测各出口延迟，挑一个最优的作为起始出口（约几秒）…');
+    const pick = await pickBestUplinkAtStartup(cfg).catch(() => ({ best: null, results: [] }));
+    for (const r of pick.results) {
+      console.log(`  ${String(r.name).padEnd(14)} ${r.ms === null ? '测不到（当作最差）' : r.ms + 'ms'}`);
+    }
+    if (pick.best) {
+      picked = pick.best;
+      // 通过环境变量传给守护进程（它由 ensureRunning 派生，会继承到）
+      process.env.CODEX_PROXY_STARTUP_PREFER = picked;
+      console.log(`  → 起始出口选 ${picked}（不钉住，之后劣化仍会自动切）`);
+    } else {
+      console.log('  → 都测不到，改按配置里的 priority 顺序选');
+    }
+  }
 
   const rc = await ensureRunning(cfg);
   if (rc !== 0) return rc;
@@ -3435,6 +3569,8 @@ export {
   measureUplink,
   formatResolveInfo,
   parseInstalledArg,
+  pickBestUplinkAtStartup,
+  countLocalConnectionsTo,
   yamlScalar,
   parseProfileProxies,
   isMainModule,

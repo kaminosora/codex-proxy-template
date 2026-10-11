@@ -258,6 +258,43 @@ step('11~13. 强制指定（use）与解除');
     d2.activeUplink?.name === 'clash-party', `active=${d2.activeUplink?.name}`);
 }
 
+step('X. 严重劣化时跳过"连续 N 次"，立刻切（slowHardMs）');
+{
+  // 动机（实测）：ssh:jp 从 297ms 突然跳到 4318ms 并持续约 4 分钟，
+  // 而默认要连续 satisfiedPolls(3) 次 ≈ 45 秒才切 —— 那段时间界面拿不到 workspace 设置。
+  const cfgH = M.loadConfig().health;
+  const mk = (curMs, candMs, prev = null, cd = 0) => {
+    const health = new Map([
+      ['cur', { ok: true, latencyFresh: true, lastMs: curMs }],
+      ['cand', { ok: true, latencyFresh: true, lastMs: candMs }],
+    ]);
+    return M.decideLatencySwitch({
+      healthy: [{ name: 'cur' }, { name: 'cand' }], current: { name: 'cur' },
+      health, cfg: cfgH, prevStreak: prev, cooldownUntil: cd, now: Date.now(),
+    });
+  };
+  check('slowHardMs 默认是 1500', cfgH.slowHardMs === 1500, `实际 ${cfgH.slowHardMs}`);
+  const d1 = mk(4318, 180);
+  check('严重劣化（4318ms）→ 第一次就切，reason=switch-hard',
+    d1.switch === true && d1.reason === 'switch-hard', `reason=${d1.reason}`);
+  const d2 = mk(1500, 300);
+  check('刚好到阈值（1500ms）也算劣化', d2.switch === true && d2.reason === 'switch-hard', `reason=${d2.reason}`);
+  const d3 = mk(1499, 300);
+  check('差 1ms（1499ms）→ 回到"连续 N 次"的常规路径，不立刻切',
+    d3.switch === false && d3.reason === 'pending', `reason=${d3.reason}`);
+  const d4 = mk(297, 152);
+  check('当前够快（297ms 且候选不够快）→ 不切（不是只看硬阈值）',
+    d4.switch === false, `reason=${d4.reason}`);
+  const d5 = mk(4318, 4200);
+  check('硬阈值也要候选满足增益条件：候选 4200ms 不算更优 → 不切',
+    d5.switch === false, `reason=${d5.reason}`);
+  const d6 = mk(4318, 180, null, Date.now() + 60000);
+  check('冷静期内即使严重劣化也不切（防抖动优先级最高）',
+    d6.switch === false && d6.reason === 'cooldown', `reason=${d6.reason}`);
+  const d7 = mk(4318, 180, null, 0);
+  check('切换后会设冷静期', d7.cooldownUntil > Date.now(), '');
+}
+
 console.log('\n=== 汇总 ===');
 const pass = results.filter((r) => r.ok).length;
 console.log(`${pass}/${results.length} 通过`);
