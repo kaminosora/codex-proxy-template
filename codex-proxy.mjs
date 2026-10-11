@@ -88,7 +88,12 @@ function loadConfig() {
     minGainMs: 150,        // 且至少快这么多毫秒，避免"50ms→20ms 也切"
     satisfiedPolls: 3,     // 连续满足多少次才切换（3 × 15s ≈ 45 秒）
     cooldownMs: 120000,    // 切换后的冷静期（2 分钟）
-    connIdleTimeoutSec: 120,   // 连接连续这么久无数据就断开，逼客户端重连（防上游黑洞卡死界面）
+    // ★ 这两个值是"兜底清理"用的，必须保守 —— 它们会误杀 Codex 的长连接 ★
+    //   Codex 的 WebSocket / 推送连接正常就是"长时间没数据但在等"，早期设 120 秒
+    //   一刀切，实测把它的正常长连接杀了、界面直接退化（日志有据）。
+    //   真正防"卡住"的是切换时只断卡住的、以及判 DOWN 时全断。
+    connIdleTimeoutSec: 600,    // 10 分钟：只有这么久没数据、且从未传过字节，才清
+    connIdleMaxSec: 1800,       // 30 分钟：传过数据的连接的上限兜底
     // 切换出口时断开旧连接的"宽限"：只有空闲超过这么久（毫秒）的连接才算"卡住"、才断。
     // 为什么要宽限：Codex 是 Chromium，无条件断连会把它的在途请求腰斩，
     // 界面退化成「Couldn't load workspace settings」（用户实测报告）。
@@ -763,15 +768,47 @@ class Bridge {
     return dropped;
   }
 
-  /** 兜底：清掉长时间完全没数据的连接（防上游黑洞导致的"卡住但不断"） */
+  /**
+   * 兜底：清掉**被遗弃**的连接（防上游黑洞导致的"卡住但不断"）。
+   *
+   * ★ 这里必须非常保守 —— 踩过一个很严重的坑 ★
+   *
+   *   Codex 是 Chromium，它有很多**长连接**（WebSocket / 服务端推送 / HTTP/2 复用），
+   *   这些连接的特征就是"长时间没有应用层数据"，但它们是**活的、正在等推送**。
+   *
+   *   早期这里一刀切：任何连接 120 秒没数据就杀。实测后果（用户报告 + 日志证实）：
+   *     [warn] 空闲超时（134s 无数据）主动断开：…:61429 @ ssh:jp
+   *     [warn] 空闲超时（135s 无数据）主动断开：…:61431 @ ssh:jp
+   *   把 Codex 正常的长连接杀掉，界面立刻退化（"Couldn't load workspace settings"）。
+   *
+   *   所以现在要求【三个条件同时成立】才清：
+   *     ① 空闲超过一个**很大的**阈值（默认 10 分钟，不是 2 分钟）
+   *     ② 这条连接**从来没传过任何数据**（bytes === 0）——
+   *        传过数据的说明它工作过，之后安静多半是在等推送，不能动
+   *     ③ 空闲超过 maxIdleMs（上限兜底，默认 30 分钟）
+   *
+   *   "卡住"的主要防线其实不在这里 —— 而是出口切换时只断卡住的连接、
+   *   以及出口被判 DOWN 时全断（见 dropConnectionsOnUplink）。这一层只是
+   *   最后兜底：清掉"连上了但什么都没发生过、然后被彻底遗忘"的连接。
+   */
   reapIdleConnections(idleMs) {
     if (!idleMs || idleMs <= 0) return 0;
     const now = Date.now();
+    const maxIdleMs = Number(this.cfg?.health?.connIdleMaxSec ?? 1800) * 1000;
     let n = 0;
     for (const rec of [...this.conns]) {
-      if (now - rec.lastActivity < idleMs) continue;
+      const idle = now - rec.lastActivity;
+      if (idle < idleMs) continue;
+
+      // ② 传过数据的一律不动 —— 那可能是 Codex 在等的长连接。
+      //    真要清理它们，靠的是"切换/判 DOWN"那两条，而不是这条定时清理。
+      if ((rec.bytes || 0) > 0 && idle < maxIdleMs) continue;
+
       n++;
-      log('warn', `空闲超时（${Math.round((now - rec.lastActivity) / 1000)}s 无数据）主动断开：${rec.peer} @ ${rec.uplink}`);
+      const why = (rec.bytes || 0) > 0
+        ? `空闲超过上限（${Math.round(idle / 1000)}s 无数据，共传过 ${fmtBytes(rec.bytes)}）`
+        : `空闲 ${Math.round(idle / 1000)}s 且从未传过数据`;
+      log('warn', `清理被遗弃的连接：${why} — ${rec.peer} @ ${rec.uplink}`);
       try { rec.client.destroy(); } catch {}
       try { rec.upstream.destroy(); } catch {}
     }
@@ -1691,7 +1728,8 @@ class Daemon {
         try { this.bridge.reapIdleConnections(idleSec * 1000); } catch {}
       }, Math.min(15000, Math.max(5000, (idleSec * 1000) / 3)));
       this.idleTimer.unref?.();
-      log('info', `空闲连接清理已启用：${idleSec}s 无数据则断开（逼客户端重连）`);
+      log('info', `空闲连接清理已启用：${idleSec}s 无数据【且从未传过字节】才清（保守值，避免误杀 Codex 的长连接）` +
+        `；传过数据的连接上限 ${this.cfg.health.connIdleMaxSec ?? 1800}s`);
     }
     this.writeState();
     log('info', `就绪。当前出口：${this.activeUplink ? this.activeUplink.name : '无'}`);

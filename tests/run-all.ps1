@@ -43,6 +43,7 @@ $suites = @(
     @{ Id = '20'; Kind = 'mjs'; File = '20-test-doc-consistency.mjs'; Name = 'README 预期结果 vs 真实断言数';        Slow = $true;  Need = '允许启动子进程' }
     @{ Id = '21'; Kind = 'mjs'; File = '21-doc-details.mjs';       Name = '文档细节（代码片段/锚点/文案归属）';      Slow = $false; Need = '无' }
     @{ Id = '22'; Kind = 'mjs'; File = '22-switch-drop-grace.mjs';   Name = '切换出口时的断连宽限（不腰斩在途）';       Slow = $false; Need = '无' }
+    @{ Id = '23'; Kind = 'mjs'; File = '23-idle-reaper-safety.mjs'; Name = '空闲清理不误杀长连接（Codex 界面退化的根因）';  Slow = $false; Need = '无' }
 )
 
 # 注意：必须用 @() 包起来。只筛出一个套件时，Where-Object 返回的是【单个哈希表】，
